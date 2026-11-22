@@ -49,7 +49,12 @@ final class ConversationViewModel {
     var hasCompletedSetup: Bool = UserDefaults.standard.bool(forKey: "hasCompletedSetup") {
         didSet { UserDefaults.standard.set(hasCompletedSetup, forKey: "hasCompletedSetup") }
     }
-    var showSetup: Bool { !hasCompletedSetup || !allReady }
+    /// After setup, a missing enhanced Korean voice alone (iOS can delete voices) never sends the user back to setup.
+    private var essentialReady: Bool { readiness.filter { $0.kind != .koVoice }.allSatisfy(\.isReady) }
+    var showSetup: Bool { hasCompletedSetup ? !essentialReady : !allReady }
+    /// Setup done but the enhanced Korean voice is gone: speaking with the default-quality voice.
+    var usingFallbackVoice: Bool { hasCompletedSetup && !readiness[kind: .koVoice].isReady }
+    private static let essentialKinds = Set(ReadinessKind.allCases).subtracting([.koVoice])
 
     // MARK: Conversation
     var messages: [Message] = []
@@ -149,19 +154,20 @@ final class ConversationViewModel {
         applyUnlessTransient(checker.readyKinds()) // cached value now, fresh value after refresh()
         Task {
             await checker.refresh()
+            speech.refreshVoice() // a deleted premium voice must not stay referenced
             var ready = checker.readyKinds()
-            if hasCompletedSetup && ready.count < ReadinessKind.allCases.count && !confirmed {
+            if hasCompletedSetup && !ready.isSuperset(of: Self.essentialKinds) && !confirmed {
                 try? await Task.sleep(for: .seconds(1))
                 await checker.refresh()
                 ready = checker.readyKinds()
             }
             apply(ready)
-            if hasCompletedSetup && !allReady { hasCompletedSetup = false } // data went missing: re-confirm
+            if hasCompletedSetup && !essentialReady { hasCompletedSetup = false } // data went missing: re-confirm
         }
     }
     /// Completed setup + a failing value is not shown until it is confirmed.
     private func applyUnlessTransient(_ ready: Set<ReadinessKind>) {
-        if hasCompletedSetup && ready.count < ReadinessKind.allCases.count { return }
+        if hasCompletedSetup && !ready.isSuperset(of: Self.essentialKinds) { return }
         apply(ready)
     }
     func resume() { listening.resume() }

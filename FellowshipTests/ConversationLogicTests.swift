@@ -27,7 +27,8 @@ private final class FakeListening: ListeningEngine {
 
 @MainActor
 private final class FakeChecker: ReadinessChecker {
-    func readyKinds() -> Set<ReadinessKind> { Set(ReadinessKind.allCases) }
+    var kinds = Set(ReadinessKind.allCases)
+    func readyKinds() -> Set<ReadinessKind> { kinds }
     func prepare(_ kind: ReadinessKind) async {}
     func refresh() async {}
 }
@@ -39,6 +40,23 @@ private func makeVM(_ speech: FakeSpeech = FakeSpeech(), _ listening: FakeListen
 
 @MainActor
 struct ConversationLogicTests {
+    // MARK: readiness
+    @Test func missingKoVoiceAfterSetupKeepsConversationWithFallbackNotice() {
+        let was = UserDefaults.standard.bool(forKey: "hasCompletedSetup")
+        defer { UserDefaults.standard.set(was, forKey: "hasCompletedSetup") }
+        let checker = FakeChecker()
+        checker.kinds.remove(.koVoice)
+        let vm = ConversationViewModel(listening: FakeListening(), checker: checker, speech: FakeSpeech())
+        vm.hasCompletedSetup = false
+        vm.refreshReadiness()
+        #expect(vm.showSetup)
+        #expect(!vm.usingFallbackVoice)
+        vm.hasCompletedSetup = true
+        vm.refreshReadiness()
+        #expect(!vm.showSetup)
+        #expect(vm.usingFallbackVoice)
+    }
+
     // MARK: speech queue & rate
     @Test func rateGrowsWithBacklogAndIsCapped() {
         let r = ConversationViewModel.rate(forQueueLength:)

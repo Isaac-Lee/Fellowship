@@ -33,7 +33,10 @@ protocol SpeechOutput {
     /// Speaks one utterance; the VM owns the queue and the rate. A stopImmediately() must suppress onFinish.
     func speak(_ text: String, rate: Float, onFinish: @escaping @MainActor () -> Void)
     func stopImmediately()
+    /// Re-pick the voice (a better one may have appeared, or the premium one been deleted).
+    func refreshVoice()
 }
+extension SpeechOutput { func refreshVoice() {} }
 
 @MainActor
 protocol ReadinessChecker {

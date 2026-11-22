@@ -55,6 +55,7 @@ struct ConversationView: View {
         HStack {
             Text(vm.earphonesConnected ? "🎧 이어폰 연결됨" : "🎧 이어폰 연결 안 됨").font(.subheadline.weight(.medium))
             Spacer()
+            if vm.usingFallbackVoice { Text("기본 음성으로 읽는 중").font(.caption).foregroundStyle(.secondary) }
             #if DEBUG
             Text("속도 \(vm.speechRate, specifier: "%.2f") · 대기 \(vm.pendingSpeechCount)")
                 .font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
