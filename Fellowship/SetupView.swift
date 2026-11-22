@@ -5,7 +5,7 @@ struct SetupView: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            Text("준비 확인").font(.largeTitle.bold()).frame(maxWidth: .infinity, alignment: .leading)
+            Text("준비 확인").font(.largeTitle.weight(.semibold)).frame(maxWidth: .infinity, alignment: .leading)
             ScrollView {
             VStack(spacing: 0) {
                 ForEach(vm.readiness) { item in
@@ -13,28 +13,30 @@ struct SetupView: View {
                         Text(item.kind.title).font(.title3)
                         Spacer()
                         if item.isReady {
-                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.title)
+                            Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.readyGreen).font(.title)
                         } else if item.isDownloading {
                             ProgressView()
                         } else {
                             Button { vm.download(item) } label: {
-                                Image(systemName: "arrow.down.circle.fill").font(.title)
+                                Image(systemName: "arrow.down.circle.fill").font(.title).foregroundStyle(Color.seal)
                             }
                             .accessibilityLabel("\(item.kind.title) 다운로드")
                         }
                     }
-                    .padding(.vertical, 14)
-                    Divider()
+                    .frame(minHeight: 64)
+                    Divider().overlay(Color.hairline)
                 }
             }
             }
-            Button("시작하기") { vm.completeSetup() }
-                .font(.title2.bold())
-                .frame(maxWidth: .infinity, minHeight: 56)
-                .buttonStyle(.borderedProminent)
-                .disabled(!vm.allReady)
+            Button { vm.completeSetup() } label: {
+                Text("시작하기").font(.title3.weight(.semibold))
+                    .foregroundStyle(vm.allReady ? Color.inkOn : Color.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 56)
+                    .background(vm.allReady ? Color.ink : Color.surface, in: .rect(cornerRadius: 16))
+            }
+            .disabled(!vm.allReady)
         }
-        .padding()
+        .padding(16)
     }
 }
 

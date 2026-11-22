@@ -14,7 +14,7 @@ struct DebugMenu: View {
             Button("문장 밀림") { vm.simulateBacklog() }
             Button("준비 화면 초기화", role: .destructive) { vm.resetSetup() }
         } label: {
-            Image(systemName: "ladybug").font(.title3)
+            Image(systemName: "ladybug").font(.footnote).foregroundStyle(.tertiary)
         }
     }
 }
