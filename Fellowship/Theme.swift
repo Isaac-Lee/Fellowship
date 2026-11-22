@@ -21,6 +21,8 @@ extension Color {
     static let amberBanner = Color(light: 0xF0C95C, dark: 0xE6BF52)
     static let amberText = Color(light: 0x2B2100, dark: 0x2B2100)
     static let readyGreen = Color(light: 0x2F7D4F, dark: 0x5FB57F)
+    /// 내 말풍선 배경: 인주색 ~10%(라이트) / ~22%(다크)를 배경 위에 얹은 값
+    static let sealTint = Color(light: 0xF7E9E6, dark: 0x422521)
     static let surface = Color(.secondarySystemBackground)
     static let hairline = Color.primary.opacity(0.08)
 }

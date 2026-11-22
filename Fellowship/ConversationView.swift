@@ -20,14 +20,16 @@ struct ConversationView: View {
                     messageList
                     HStack(spacing: 0) {
                         Rectangle().fill(Color.hairline).frame(width: 1)
-                        talkArea.background(Color.surface)
+                            .ignoresSafeArea(edges: .vertical)
+                        talkArea
                     }
+                    .background(Color.surface.ignoresSafeArea(edges: [.bottom, .trailing]))
                     .containerRelativeFrame(.horizontal) { w, _ in w * 0.22 }
                 }
             } else {
                 messageList
                 Divider().overlay(Color.hairline)
-                talkArea.background(Color.surface)
+                talkArea.background(Color.surface.ignoresSafeArea(edges: .bottom))
             }
         }
         .background(Color(.systemBackground))
@@ -63,9 +65,14 @@ struct ConversationView: View {
                         }
                     }
                     if let p = vm.partnerPartial {
-                        Text(p).font(.title3).foregroundStyle(.secondary).opacity(0.8)
-                            .padding(12).background(Color.surface, in: .rect(cornerRadius: 16))
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        bubbleBox(mine: false) {
+                            Text(p).font(.title3).foregroundStyle(.secondary).opacity(0.8)
+                        }
+                    }
+                    if vm.isHoldingToTalk && !vm.myPartial.isEmpty {
+                        bubbleBox(mine: true) {
+                            Text(vm.myPartial).font(.title3).foregroundStyle(.secondary).opacity(0.8)
+                        }
                     }
                     Color.clear.frame(height: 1).id("bottom")
                 }
@@ -73,21 +80,30 @@ struct ConversationView: View {
             }
             .onChange(of: vm.messages.count) { withAnimation { proxy.scrollTo("bottom") } }
             .onChange(of: vm.partnerPartial) { proxy.scrollTo("bottom") }
+            .onChange(of: vm.myPartial) { proxy.scrollTo("bottom") }
         }
     }
 
     private func bubble(_ m: Message) -> some View {
-        let mine = m.speaker == .me
-        return VStack(alignment: .leading, spacing: 4) {
-            Text(m.original).font(.footnote).foregroundStyle(.secondary)
-            Text(m.translation).font(.title2.weight(.semibold)).foregroundStyle(.primary)
+        bubbleBox(mine: m.speaker == .me) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(m.original).font(.footnote).foregroundStyle(.secondary)
+                Text(m.translation).font(.title2.weight(.semibold)).foregroundStyle(.primary)
+            }
         }
-        .padding(.vertical, 12).padding(.horizontal, 16)
-        .background(Color.surface, in: .rect(cornerRadius: 16))
-        .overlay(alignment: .leading) {
-            if mine { Rectangle().fill(Color.seal).frame(width: 3).padding(.vertical, 12) }
+    }
+
+    /// 말풍선 공통 틀: 내 쪽은 오른쪽·인주 틴트·오른쪽 아래 모서리 6, 상대는 왼쪽·surface·왼쪽 아래 모서리 6
+    private func bubbleBox<C: View>(mine: Bool, @ViewBuilder content: () -> C) -> some View {
+        HStack(spacing: 0) {
+            if mine { Spacer(minLength: 48) }
+            content()
+                .padding(.vertical, 12).padding(.horizontal, 16)
+                .background(mine ? Color.sealTint : Color.surface,
+                            in: UnevenRoundedRectangle(topLeadingRadius: 20, bottomLeadingRadius: mine ? 20 : 6,
+                                                       bottomTrailingRadius: mine ? 6 : 20, topTrailingRadius: 20))
+            if !mine { Spacer(minLength: 48) }
         }
-        .frame(maxWidth: .infinity, alignment: mine ? .trailing : .leading)
     }
 
     private var talkArea: some View {
@@ -95,9 +111,6 @@ struct ConversationView: View {
             if vm.retryHint { Text("다시 말해 주세요").font(.subheadline.weight(.medium)).foregroundStyle(Color.sealText) }
             if vm.isHoldingToTalk {
                 Text("● 듣는 중…").font(.subheadline.weight(.medium)).foregroundStyle(Color.sealText)
-                Text(vm.myPartial).font(.title3).foregroundStyle(.secondary).frame(minHeight: 28)
-                    .lineLimit(landscape ? 3 : nil)
-                    .minimumScaleFactor(landscape ? 0.7 : 1)
             }
             Group {
                 if landscape {
