@@ -23,6 +23,6 @@ struct DebugMenu: View {
 }
 
 #Preview {
-    DebugMenu(vm: ConversationViewModel())
+    DebugMenu(vm: ConversationViewModel.preview())
 }
 #endif

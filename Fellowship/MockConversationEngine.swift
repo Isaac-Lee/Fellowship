@@ -35,6 +35,8 @@ protocol SpeechOutput {
 protocol ReadinessChecker {
     func readyKinds() -> Set<ReadinessKind>
     func prepare(_ kind: ReadinessKind) async
+    /// Recomputes whatever `readyKinds()` serves from cache.
+    func refresh() async
 }
 
 // MARK: - Mock implementations
@@ -54,6 +56,7 @@ final class MockConversationEngine: ListeningEngine, ReadinessChecker {
     // Readiness (persisted flag stands in for real permission/model checks).
     var ready: Set<ReadinessKind> = UserDefaults.standard.bool(forKey: "hasCompletedSetup") ? Set(ReadinessKind.allCases) : []
     func readyKinds() -> Set<ReadinessKind> { ready }
+    func refresh() async {}
     func prepare(_ kind: ReadinessKind) async {
         try? await Task.sleep(for: .seconds(1))
         ready.insert(kind)

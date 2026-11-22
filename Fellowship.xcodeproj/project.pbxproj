@@ -233,6 +233,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ENABLE_TESTABILITY = YES;
 				DEVELOPMENT_TEAM = JZ3V9AT7N5;
 				INFOPLIST_KEY_CFBundleDisplayName = Fellowship;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "상대의 말과 내 말을 듣고 번역하려면 마이크가 필요해요.";

@@ -138,7 +138,7 @@ struct ConversationView: View {
 }
 
 #Preview {
-    let vm = ConversationViewModel()
+    let vm = ConversationViewModel.preview()
     vm.messages = [
         Message(speaker: .partner, original: "歡迎光臨！請問幾位？", translation: "어서 오세요! 몇 분이세요?"),
         Message(speaker: .me, original: "화장실이 어디예요?", translation: "請問洗手間在哪裡？"),
@@ -150,7 +150,7 @@ struct ConversationView: View {
 }
 
 #Preview("가로", traits: .landscapeLeft) {
-    let vm = ConversationViewModel()
+    let vm = ConversationViewModel.preview()
     vm.messages = [
         Message(speaker: .partner, original: "歡迎光臨！請問幾位？", translation: "어서 오세요! 몇 분이세요?"),
         Message(speaker: .me, original: "화장실이 어디예요?", translation: "請問洗手間在哪裡？"),

@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import Translation
 
 enum Speaker { case partner, me }
 
@@ -78,6 +79,8 @@ final class ConversationViewModel {
     @ObservationIgnored private var speechGeneration = 0
     @ObservationIgnored private var eventsTask: Task<Void, Never>?
     @ObservationIgnored private var retryTask: Task<Void, Never>?
+    @ObservationIgnored private var routeMonitor: AudioRouteMonitor?
+    @ObservationIgnored private var routeKnown = false
 
     init(listening: ListeningEngine, checker: ReadinessChecker, speech: SpeechOutput) {
         self.listening = listening
@@ -87,8 +90,32 @@ final class ConversationViewModel {
     }
 
     convenience init() {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-mock") {
+            let mock = MockConversationEngine()
+            self.init(listening: mock, checker: mock, speech: MockSpeaker())
+            return
+        }
+        #endif
+        let engine = LiveListeningEngine()
+        self.init(listening: engine, checker: LiveReadinessChecker(), speech: SpeechSynthesizerOutput())
+        engine.onMissingData = { [weak self] in self?.refreshReadiness() }
+        routeMonitor = AudioRouteMonitor { [weak self] connected in self?.routeChanged(connected: connected) }
+    }
+
+    /// All-mock VM for SwiftUI previews.
+    static func preview() -> ConversationViewModel {
         let mock = MockConversationEngine()
-        self.init(listening: mock, checker: mock, speech: MockSpeaker())
+        return ConversationViewModel(listening: mock, checker: mock, speech: MockSpeaker())
+    }
+
+    // Live-checker hooks for SetupView (nil/false with mocks).
+    private var live: LiveReadinessChecker? { checker as? LiveReadinessChecker }
+    var translationRequest: TranslationSession.Configuration? { live?.translationRequest }
+    func translationPrepared(ok: Bool) { live?.translationPrepared(ok: ok) }
+    var showVoiceHelp: Bool {
+        get { live?.showVoiceHelp ?? false }
+        set { live?.showVoiceHelp = newValue }
     }
 
     // MARK: Pure rules (unit-testable in stage 2)
@@ -100,7 +127,14 @@ final class ConversationViewModel {
     // MARK: Setup actions
     /// Called at launch and when the app becomes active; stage 2 detects missing data here.
     func refreshReadiness() {
-        let ready = checker.readyKinds()
+        apply(checker.readyKinds()) // cached value now, fresh value after refresh()
+        Task {
+            await checker.refresh()
+            apply(checker.readyKinds())
+            if hasCompletedSetup && !allReady { hasCompletedSetup = false } // data went missing: re-confirm
+        }
+    }
+    private func apply(_ ready: Set<ReadinessKind>) {
         for kind in ReadinessKind.allCases { readiness[kind: kind].isReady = ready.contains(kind) }
     }
     func download(_ item: ReadinessItem) {
@@ -109,7 +143,7 @@ final class ConversationViewModel {
         Task {
             await checker.prepare(item.kind)
             readiness[kind: item.kind].isDownloading = false
-            refreshReadiness()
+            apply(checker.readyKinds())
         }
     }
     func completeSetup() { if allReady { hasCompletedSetup = true } }
@@ -168,7 +202,7 @@ final class ConversationViewModel {
         isTranslating = false
     }
 
-    private func handle(_ event: ListenEvent) {
+    func handle(_ event: ListenEvent) {
         switch event {
         case .partnerPartial(let s): partnerPartial = s
         case .partnerFinal(let zh, let ko):
@@ -216,6 +250,11 @@ final class ConversationViewModel {
         isSpeaking = false
         speakQueue.removeAll()
         speech.stopImmediately()
+    }
+
+    /// Monitor entry point: the first report is the launch state (no banner), later ones are changes.
+    private func routeChanged(connected: Bool) {
+        if routeKnown { earphonesDidChange(connected: connected) } else { earphonesConnected = connected; routeKnown = true }
     }
 
     /// Route-change entry point (stage 2: AVAudioSession). Unplug silences; sentences after replug are spoken.

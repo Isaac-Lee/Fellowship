@@ -1,11 +1,13 @@
 import SwiftUI
 
 struct ContentView: View {
-    @State private var vm = ConversationViewModel()
+    @State private var vm: ConversationViewModel
     @Environment(\.scenePhase) private var scenePhase
     #if DEBUG
     @State private var showProbe = ProcessInfo.processInfo.arguments.contains("-probe")
     #endif
+
+    init(vm: ConversationViewModel = ConversationViewModel()) { _vm = State(initialValue: vm) }
 
     var body: some View {
         Group {
@@ -20,5 +22,5 @@ struct ContentView: View {
 }
 
 #Preview {
-    ContentView()
+    ContentView(vm: .preview())
 }
