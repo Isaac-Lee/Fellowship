@@ -17,7 +17,7 @@ struct ConversationView: View {
             if landscape {
                 HStack(spacing: 0) {
                     messageList
-                    talkArea.containerRelativeFrame(.horizontal) { w, _ in w * 0.3 }
+                    talkArea.containerRelativeFrame(.horizontal) { w, _ in w * 0.22 }
                 }
             } else {
                 messageList
@@ -83,16 +83,26 @@ struct ConversationView: View {
 
     private var talkArea: some View {
         VStack(spacing: 8) {
-            if landscape { Spacer(minLength: 0) }
             if vm.retryHint { Text("다시 말해 주세요").font(.headline).foregroundStyle(.orange) }
             if vm.isHoldingToTalk {
                 Text("● 듣는 중…").font(.headline).foregroundStyle(.red)
                 Text(vm.myPartial).font(.title3).foregroundStyle(.secondary).frame(minHeight: 28)
                     .lineLimit(landscape ? 3 : nil)
+                    .minimumScaleFactor(landscape ? 0.7 : 1)
             }
-            Text(vm.isHoldingToTalk ? "손을 떼면 번역해요" : "🎤 누르고 말하기")
-                .font(landscape ? .title2.bold() : .title.bold()).foregroundStyle(.white)
-                .frame(maxWidth: .infinity, minHeight: 88, maxHeight: 88)
+            Group {
+                if landscape {
+                    VStack(spacing: 8) {
+                        Image(systemName: "mic.fill").font(.largeTitle)
+                        Text(vm.isHoldingToTalk ? "손을 떼면\n번역해요" : "누르고\n말하기")
+                            .multilineTextAlignment(.center)
+                    }
+                } else {
+                    Text(vm.isHoldingToTalk ? "손을 떼면 번역해요" : "🎤 누르고 말하기")
+                }
+            }
+                .font(landscape ? .title3.bold() : .title.bold()).foregroundStyle(.white)
+                .frame(maxWidth: .infinity, minHeight: 88, maxHeight: landscape ? .infinity : 88)
                 .background(vm.isHoldingToTalk ? Color.red : Color.blue, in: .rect(cornerRadius: 24))
                 .onLongPressGesture(minimumDuration: .infinity, maximumDistance: 200, perform: {},
                                     onPressingChanged: { $0 ? vm.pressBegan() : vm.pressEnded() })
