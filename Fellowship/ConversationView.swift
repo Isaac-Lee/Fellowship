@@ -17,7 +17,7 @@ struct ConversationView: View {
             if landscape {
                 HStack(spacing: 0) {
                     messageList
-                    talkArea.containerRelativeFrame(.horizontal) { w, _ in w * 0.38 }
+                    talkArea.containerRelativeFrame(.horizontal) { w, _ in w * 0.3 }
                 }
             } else {
                 messageList
@@ -91,8 +91,8 @@ struct ConversationView: View {
                     .lineLimit(landscape ? 3 : nil)
             }
             Text(vm.isHoldingToTalk ? "손을 떼면 번역해요" : "🎤 누르고 말하기")
-                .font(.title.bold()).foregroundStyle(.white)
-                .frame(maxWidth: .infinity, minHeight: 88, maxHeight: landscape ? .infinity : 88)
+                .font(landscape ? .title2.bold() : .title.bold()).foregroundStyle(.white)
+                .frame(maxWidth: .infinity, minHeight: 88, maxHeight: 88)
                 .background(vm.isHoldingToTalk ? Color.red : Color.blue, in: .rect(cornerRadius: 24))
                 .onLongPressGesture(minimumDuration: .infinity, maximumDistance: 200, perform: {},
                                     onPressingChanged: { $0 ? vm.pressBegan() : vm.pressEnded() })
