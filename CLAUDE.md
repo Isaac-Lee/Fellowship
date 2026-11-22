@@ -18,3 +18,4 @@ Offline Mandarin ↔ Korean interpreter iOS app. Design: `docs/design.md` (sourc
 ```bash
 xcodebuild -project Fellowship.xcodeproj -scheme Fellowship -destination 'generic/platform=iOS Simulator' build
 ```
+"BUILD SUCCEEDED" alone is not proof: also confirm the log has `SwiftCompile` lines and the built `.app` contains the `Fellowship` executable (a target with no build phases "succeeds" while compiling nothing).

@@ -95,7 +95,9 @@ final class MockConversationEngine: ListeningEngine, ReadinessChecker {
         line = nil; idleTicks = 25
         let sample = Self.mySamples[sampleIndex % Self.mySamples.count]
         let fail = failNextRecognition || myShown == 0
+        #if DEBUG
         failNextRecognition = false
+        #endif
         myTask = Task {
             try? await Task.sleep(for: .seconds(0.6)) // fake translation latency
             if Task.isCancelled { return }
