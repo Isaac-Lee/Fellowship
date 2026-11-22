@@ -1,0 +1,79 @@
+# Fellowship
+
+Offline Mandarin ↔ Korean conversation interpreter for iPhone. Hear Taiwanese Mandarin translated into Korean through wired earphones, and show your Korean as large Traditional Chinese text on screen. Runs fully on-device with Apple's speech and translation frameworks.
+
+대만에서 현지인과 대화할 때 혼자 쓰는 아이폰 통역 앱입니다. 상대가 중국어로 말하면 한국어 음성으로 유선 이어폰에 들려 주고, 내가 한국어로 말하면 번체 중국어로 바꿔 화면에 크게 보여 줍니다. 인터넷 없이 기기 안에서만 동작합니다.
+
+## 어떻게 쓰나
+
+| 상황 | 하는 일 | 결과 |
+|---|---|---|
+| 상대가 말할 때 | 아무것도 안 해도 됨 (항상 듣는 중) | 중국어 원문과 한국어 번역이 말풍선으로 뜨고, 한국어가 이어폰으로 나옴 |
+| 내가 말할 때 | "🎤 누르고 말하기"를 누른 채 한국어로 말하고 손을 뗌 | 번체 중국어가 화면 가득 뜸, 상대에게 화면을 보여 줌 |
+| 카드 닫기 | 화면 아무 곳이나 탭 | 대화 화면으로 돌아감 |
+| 마주 앉은 상대에게 | 카드 오른쪽 위 ↻ | 글자가 180도 돌아감 |
+
+- 상대 말풍선을 탭하면 한국어를 다시 읽어 줍니다. 내 말풍선을 탭하면 카드를 다시 엽니다.
+- 버튼을 0.5초보다 짧게 누르면 무시합니다.
+- 이어폰이 빠지면 음성을 바로 끄고(스피커로 나오지 않음) 노란 배너를 띄웁니다. 다시 꽂으면 자동으로 재개합니다.
+- 읽어 줄 문장이 밀리면 음성 속도를 높입니다.
+- 세로·가로 모두 지원합니다.
+
+## 요구 사항
+
+- iPhone, iOS 26 이상 (개발·테스트 기기: iPhone Air)
+- USB-C 유선 이어폰 (마이크 포함). 블루투스 이어폰은 지원하지 않습니다.
+- Mac + Xcode 27 이상, 무료 Apple ID
+- 외부 패키지 없음. SpeechAnalyzer/SpeechTranscriber, Translation, AVSpeechSynthesizer, AVAudioSession만 씁니다.
+
+## 설치 (무료 Apple ID)
+
+1. 레포를 받고 프로젝트를 엽니다.
+   ```bash
+   git clone https://github.com/Isaac-Lee/Fellowship.git && open Fellowship/Fellowship.xcodeproj
+   ```
+2. Fellowship 타깃 → Signing & Capabilities → Team에서 본인 Apple ID(Personal Team)를 고릅니다. 번들 ID가 겹친다는 오류가 나면 `com.isaaclee.Fellowship`을 다른 값으로 바꿉니다.
+3. 아이폰을 케이블로 연결하고 기기로 선택한 뒤 ⌘R.
+4. 처음 한 번만:
+   - 아이폰 설정 → 개인정보 보호 및 보안 → 개발자 모드 켜기 (재시동)
+   - 설치 후 설정 → 일반 → VPN 및 기기 관리 → 개발자 앱 → 본인 Apple ID → 신뢰
+
+> 무료 Apple ID로 설치한 앱은 **7일 뒤 만료**되어 실행되지 않습니다. 만료되면 3번을 다시 하면 됩니다.
+
+## 첫 실행: 준비 확인
+
+앱을 처음 켜면 준비 확인 화면이 나옵니다. **와이파이가 되는 곳에서** 모든 항목을 ✓로 만든 뒤 "시작하기"를 누릅니다.
+
+- 마이크 권한, 음성 인식 권한
+- 중국어(대만) 인식 모델
+- 중국어↔한국어 번역 데이터
+- 한국어 음성
+
+한 번 준비하면 다음부터는 이 화면을 건너뜁니다. 데이터가 지워지면 자동으로 다시 이 화면으로 돌아옵니다.
+
+## 출국 전 점검 목록
+
+- [ ] **출국 당일** Xcode로 앱을 다시 설치한다 (무료 서명은 7일 뒤 만료)
+- [ ] 앱을 열어 준비 확인 화면이 뜨지 않는지(모든 데이터가 준비됐는지) 확인한다
+- [ ] 언어 데이터(중국어 인식 모델, 번역 데이터)와 한국어 고품질 음성이 내려받아져 있다
+- [ ] **비행기 모드**를 켜고 듣기·말하기·카드가 모두 동작하는지 확인한다
+- [ ] 유선 이어폰을 꽂고 빼면서 음성이 멈췄다 다시 나오는지 확인한다
+- [ ] USB-C 이어폰과 여분 하나를 챙긴다
+
+## 개발
+
+```bash
+xcodebuild -project Fellowship.xcodeproj -scheme Fellowship -destination 'generic/platform=iOS Simulator' build
+```
+
+| 파일 | 내용 |
+|---|---|
+| `Fellowship/ConversationViewModel.swift` | 화면 상태 전부. 음성 큐와 속도 규칙, 0.5초 규칙, 이어폰 분리 처리 |
+| `Fellowship/MockConversationEngine.swift` | 엔진 프로토콜(`ListeningEngine`, `SpeechOutput`, `ReadinessChecker`)과 가짜 구현 |
+| `Fellowship/SetupView.swift` | 화면 1: 준비 확인 |
+| `Fellowship/ConversationView.swift` | 화면 2: 대화 |
+| `Fellowship/ShowCardView.swift` | 화면 3: 보여주기 카드 |
+| `Fellowship/DebugMenu.swift` | DEBUG 빌드 전용 🐞 메뉴 (이어폰 빠짐, 인식 실패, 데이터 없음, 문장 밀림 재현) |
+| `docs/design.md` | 설계 문서 (목표, 비목표, 안티목표, UX 명세) |
+
+진행 상황: 1단계(UI, 가짜 데이터) 완료 → 2단계(실제 음성 인식·번역·음성 출력 연결) 진행 중.
