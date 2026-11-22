@@ -7,16 +7,20 @@ import os
 import Accelerate
 
 /// Mic -> converted buffers for the active lane, plus RMS endpointing. Not isolated: the tap runs on an audio thread.
+/// The AVAudioEngine runs whenever the listening engine is live (not paused), whatever the sink: a mode switch is only
+/// a sink change under the lock. All engine start/stop work happens on `audioQ`, never on the main actor.
 final class LiveMicFeeder: @unchecked Sendable {
     enum Sink { case none, zh, ko }
 
-    private struct State {
+    private struct Chunk: @unchecked Sendable { var wall: Double; var dur: Double; var buf: AVAudioPCMBuffer }
+
+    private struct State: @unchecked Sendable {
         var sink = Sink.none
         var zhCont: AsyncStream<AnalyzerInput>.Continuation?
         var koCont: AsyncStream<AnalyzerInput>.Continuation?
         var zhTarget: AVAudioFormat?
         var koTarget: AVAudioFormat?
-        var converters: [Sink: AVAudioConverter] = [:]   // written on main (startEngine), read on the audio thread: lock only
+        var converters: [Sink: AVAudioConverter] = [:]   // written on audioQ (startEngine), read on the audio thread: lock only
         var onEndpoint: (@Sendable (CMTime) -> Void)?
         var timeline = 0.0                 // monotonic seconds of audio seen; independent of the input sample rate
         var zhFrames: Int64 = 0            // lane clocks, in output frames at each lane's target rate
@@ -25,6 +29,9 @@ final class LiveMicFeeder: @unchecked Sendable {
         var koStamps = 0
         var zhEnd = CMTime.zero            // lane-clock end of last buffer fed to each lane
         var koEnd = CMTime.zero
+        var koWallEnd = 0.0                // wall time up to which audio was already fed to the ko lane
+        var ring: [Chunk] = []             // last `preRoll` seconds of raw input, whatever the sink
+        var needPreRoll = false            // sink just switched to .ko
         var speechSeen = false
         var silence: TimeInterval = 0
         var span: TimeInterval = 0         // seconds since speech began without an endpoint
@@ -35,50 +42,93 @@ final class LiveMicFeeder: @unchecked Sendable {
 
     private let engine = AVAudioEngine()
     private let state = OSAllocatedUnfairLock(initialState: State())
+    private let audioQ = DispatchQueue(label: "fellowship.audio.engine")
+    private let wanted = OSAllocatedUnfairLock(initialState: false)   // engine should be running
+    // audioQ-confined:
+    private var tapRate = 0.0
+    private var restarts = 0
+    private var vpTried = false
 
     var lastVoiceDate: Date { state.withLock { $0.lastVoiceDate } }
     func lastEnd(_ s: Sink) -> CMTime { state.withLock { s == .zh ? $0.zhEnd : $0.koEnd } }
 
+    /// Only a sink change: no audio-engine work, safe on the main actor at button speed.
     func setSink(_ s: Sink) {
-        state.withLock { $0.sink = s; $0.speechSeen = false; $0.silence = 0; $0.span = 0 }
+        state.withLock {
+            if s == .ko, $0.sink != .ko { $0.needPreRoll = true }
+            $0.sink = s; $0.speechSeen = false; $0.silence = 0; $0.span = 0
+        }
     }
 
-    /// Lanes + endpoint callback. Does not touch the audio engine (mic stays off until restart()).
+    /// Lanes + endpoint callback. Does not touch the audio engine.
     func configure(zh: (AsyncStream<AnalyzerInput>.Continuation, AVAudioFormat),
                    ko: (AsyncStream<AnalyzerInput>.Continuation, AVAudioFormat),
                    onEndpoint: @escaping @Sendable (CMTime) -> Void) {
         state.withLock { $0.zhCont = zh.0; $0.koCont = ko.0; $0.zhTarget = zh.1; $0.koTarget = ko.1; $0.onEndpoint = onEndpoint }
     }
 
-    /// Start the engine, or reinstall the tap after a config change / interruption. Lanes and timeline stay.
+    /// Start the engine, or reinstall the tap after a config change / interruption, on the audio queue.
+    /// Returns immediately; `completion` (any thread) gets the final error, if any. Lanes and timeline stay.
+    func start(reactivate: Bool, completion: @escaping @Sendable (Error?) -> Void) {
+        wanted.withLock { $0 = true }
+        audioQ.async { [self] in
+            guard wanted.withLock({ $0 }) else { return }
+            do {
+                if reactivate { try AudioSessionSetup.activate() } // interruption ended / app returned: session may be deactivated
+                try restart()
+                completion(nil)
+            } catch {
+                #if DEBUG
+                print("[ENGINE] audio start failed: \(error)")
+                #endif
+                try? AudioSessionSetup.activate()
+                do { try restart(); completion(nil) } catch { completion(error) }
+            }
+        }
+    }
+
+    /// Full stop (teardown): lanes and counters reset now, the engine stops on the audio queue.
+    func stop() {
+        wanted.withLock { $0 = false }
+        state.withLock { $0 = State() }
+        audioQ.async { [self] in stopEngine() }
+    }
+
+    // MARK: audioQ only
+
     /// No-op if the engine is already running at the same input rate.
-    func restart() throws {
+    private func restart() throws {
         if engine.isRunning, engine.inputNode.outputFormat(forBus: 0).sampleRate == tapRate { return }
         stopEngine()
         try startEngine()
     }
-    private var tapRate = 0.0
-    private var restarts = 0
 
-    /// Mic off, lanes kept (listening OFF).
-    func stopEngine() {
+    private func stopEngine() {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         tapRate = 0
         state.withLock { $0.speechSeen = false; $0.silence = 0; $0.span = 0 }
     }
 
-    func stop() {
-        stopEngine()
-        state.withLock { $0 = State() }
-    }
-
     private func startEngine() throws {
         let input = engine.inputNode
-        let inFmt = input.outputFormat(forBus: 0)
+        if LiveListeningEngine.useVoiceProcessing, !vpTried { // once, before the first start; never toggled per press
+            vpTried = true
+            do {
+                try input.setVoiceProcessingEnabled(true)
+                input.voiceProcessingOtherAudioDuckingConfiguration =
+                    AVAudioVoiceProcessingOtherAudioDuckingConfiguration(enableAdvancedDucking: false, duckingLevel: .min)
+            } catch {
+                #if DEBUG
+                print("[AUDIO] voiceProcessing=failed \(error); continuing without it")
+                #endif
+            }
+        }
+        let inFmt = input.outputFormat(forBus: 0) // after VP: the real input format
         guard inFmt.sampleRate > 0 else { throw NSError(domain: "LiveMicFeeder", code: 1, userInfo: [NSLocalizedDescriptionKey: "no input format"]) }
         state.withLock { s in
             s.converters = [:]
+            s.ring = []   // old buffers may have another format
             if let zt = s.zhTarget, let c = AVAudioConverter(from: inFmt, to: zt) { s.converters[.zh] = c }
             if let kt = s.koTarget, let c = AVAudioConverter(from: inFmt, to: kt) { s.converters[.ko] = c }
             s.zhStamps = 0; s.koStamps = 0
@@ -87,6 +137,7 @@ final class LiveMicFeeder: @unchecked Sendable {
         restarts += 1
         #if DEBUG
         print("[AUDIO] engine restart #\(restarts) inputRate=\(inFmt.sampleRate)")
+        print("[AUDIO] voiceProcessing=\(input.isVoiceProcessingEnabled ? "on" : "off") inputFormat=\(inFmt)")
         #endif
         input.installTap(onBus: 0, bufferSize: 2048, format: inFmt) { @Sendable [self] buf, _ in
             handle(buf, inFmt: inFmt)
@@ -94,6 +145,8 @@ final class LiveMicFeeder: @unchecked Sendable {
         engine.prepare()
         try engine.start()
     }
+
+    // MARK: audio thread
 
     private struct Step {
         var sink: Sink
@@ -103,6 +156,16 @@ final class LiveMicFeeder: @unchecked Sendable {
         var endpoint: CMTime?
         var onEndpoint: (@Sendable (CMTime) -> Void)?
         var voiced: Bool
+        var preRoll: [Chunk]
+    }
+
+    private static func copy(_ b: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let s = b.floatChannelData,
+              let c = AVAudioPCMBuffer(pcmFormat: b.format, frameCapacity: b.frameLength),
+              let d = c.floatChannelData else { return nil }
+        c.frameLength = b.frameLength
+        for ch in 0..<Int(b.format.channelCount) { memcpy(d[ch], s[ch], Int(b.frameLength) * MemoryLayout<Float>.size) }
+        return c
     }
 
     private func handle(_ buf: AVAudioPCMBuffer, inFmt: AVAudioFormat) {
@@ -113,11 +176,16 @@ final class LiveMicFeeder: @unchecked Sendable {
         }
         let dur = Double(buf.frameLength) / inFmt.sampleRate
         let level = rms
+        nonisolated(unsafe) let copy = Self.copy(buf)
 
         // Wall timeline + endpoint decision under the lock; lane stamps are assigned after conversion.
         let st: Step = state.withLock { s in
             let wall = s.timeline
             s.timeline += dur
+            if let copy {
+                s.ring.append(Chunk(wall: wall, dur: dur, buf: copy))
+                while let f = s.ring.first, f.wall + f.dur <= wall + dur - LiveListeningEngine.preRoll { s.ring.removeFirst() }
+            }
             // Adaptive threshold: noisy rooms raise the floor so silence can still be detected.
             s.rmsHist.removeAll { $0.t < wall - LiveListeningEngine.noiseWindow }
             let floor = s.rmsHist.map(\.rms).min()
@@ -133,15 +201,34 @@ final class LiveMicFeeder: @unchecked Sendable {
                 endpoint = s.lastVoicedEnd; s.speechSeen = false; s.silence = 0; s.span = 0 // already in lane-clock time
             }
             let sink = s.sink
+            var pre: [Chunk] = []
+            if sink == .ko, s.needPreRoll {
+                s.needPreRoll = false
+                // Audio before the current buffer, minus what the ko lane already got (a quick second press).
+                pre = s.ring.filter { $0.wall < wall && $0.wall >= s.koWallEnd - 1e-6 }
+            }
             return Step(sink: sink, wall: wall, cont: sink == .zh ? s.zhCont : sink == .ko ? s.koCont : nil,
-                        conv: s.converters[sink], endpoint: endpoint, onEndpoint: s.onEndpoint, voiced: voiced)
+                        conv: s.converters[sink], endpoint: endpoint, onEndpoint: s.onEndpoint, voiced: voiced, preRoll: pre)
         }
         if let e = st.endpoint { st.onEndpoint?(e) }
-        let sink = st.sink, voiced = st.voiced, wall = st.wall
+        let sink = st.sink
         guard sink != .none, let cont = st.cont, let conv = st.conv else { return }
 
+        if !st.preRoll.isEmpty {
+            conv.reset() // drop converter tail from the previous turn; chunks below are contiguous
+            #if DEBUG
+            print("[AUDIO] preroll \(st.preRoll.count) chunks \(String(format: "%.2f", st.preRoll.reduce(0) { $0 + $1.dur }))s")
+            #endif
+            for c in st.preRoll { emit(c.buf, dur: c.dur, wall: c.wall, voiced: false, sink: sink, conv: conv, cont: cont) }
+        }
+        emit(buf, dur: dur, wall: st.wall, voiced: st.voiced, sink: sink, conv: conv, cont: cont)
+    }
+
+    /// Convert one raw buffer to the lane format and yield it stamped on the lane clock.
+    private func emit(_ buf: AVAudioPCMBuffer, dur: Double, wall: Double, voiced: Bool, sink: Sink,
+                      conv: AVAudioConverter, cont: AsyncStream<AnalyzerInput>.Continuation) {
         let target = conv.outputFormat
-        let cap = AVAudioFrameCount(Double(buf.frameLength) * target.sampleRate / inFmt.sampleRate) + 16
+        let cap = AVAudioFrameCount(Double(buf.frameLength) * target.sampleRate / buf.format.sampleRate) + 16
         guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: cap) else { return }
         let given = OSAllocatedUnfairLock(initialState: false)
         var err: NSError?
@@ -165,7 +252,8 @@ final class LiveMicFeeder: @unchecked Sendable {
             let end = CMTime(value: frames, timescale: ts)
             var n = sink == .zh ? s.zhStamps : s.koStamps
             let logIt = n < 3; n += 1
-            if sink == .zh { s.zhFrames = frames; s.zhEnd = end; s.zhStamps = n } else { s.koFrames = frames; s.koEnd = end; s.koStamps = n }
+            if sink == .zh { s.zhFrames = frames; s.zhEnd = end; s.zhStamps = n }
+            else { s.koFrames = frames; s.koEnd = end; s.koStamps = n; s.koWallEnd = wall + dur }
             if voiced { s.lastVoicedEnd = end }
             return (start, logIt)
         }
@@ -195,6 +283,12 @@ final class LiveListeningEngine: ListeningEngine {
     /// Zh finals shorter than this (voiced audio) are dropped.
     static let minFinalDuration: TimeInterval = 0.4
     static let startRetryDelay: TimeInterval = 1
+    /// Raw input kept so a press also recognizes the speech just before it.
+    nonisolated static let preRoll: TimeInterval = 0.5
+    /// Apple voice processing (echo cancel / noise suppression) on the input; set once before the first start.
+    nonisolated static let useVoiceProcessing = true
+    /// finishMine waits at most this long for a result covering the whole turn.
+    static let finalResultWait: TimeInterval = 0.3
 
     /// Called when a speech/translation model turns out not to be installed.
     var onMissingData: (@MainActor () -> Void)?
@@ -208,6 +302,7 @@ final class LiveListeningEngine: ListeningEngine {
         let cont: AsyncStream<AnalyzerInput>.Continuation
         var task: Task<Void, Never>?
         var cutoff = CMTime.zero // results whose audio range ends at or before this are stale
+        var seenEnd = CMTime.zero // largest result range end seen (finishMine waits on it)
         init(analyzer: SpeechAnalyzer, transcriber: SpeechTranscriber, format: AVAudioFormat, cont: AsyncStream<AnalyzerInput>.Continuation) {
             self.analyzer = analyzer; self.transcriber = transcriber; self.format = format; self.cont = cont
         }
@@ -278,7 +373,7 @@ final class LiveListeningEngine: ListeningEngine {
         let koEnd = feeder.lastEnd(.ko)
         let released = feeder.lastVoiceDate
         mode = resting
-        applyMode() // partner line resumes immediately; idle stops the mic
+        applyMode() // partner line resumes immediately; idle just discards audio
         guard valid else {
             koState = .idle
             if let ko { Task { await ko.flush(through: koEnd) } }
@@ -303,7 +398,8 @@ final class LiveListeningEngine: ListeningEngine {
     private func finishMine(koEnd: CMTime, released: Date) async {
         guard let ko else { koState = .idle; continuation?.yield(.myFailed); return }
         try? await ko.analyzer.finalize(through: koEnd)
-        try? await Task.sleep(for: .milliseconds(150))
+        let deadline = Date().addingTimeInterval(Self.finalResultWait)
+        while ko.seenEnd < koEnd, Date() < deadline { try? await Task.sleep(for: .milliseconds(10)) } // results usually already in
         let text = (koFinals + [koVolatile]).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         if koState == .finalizing { koState = .idle }
         if koEnd > ko.cutoff { ko.cutoff = koEnd } // late results of this turn must not leak into the next
@@ -396,6 +492,7 @@ final class LiveListeningEngine: ListeningEngine {
 
     private func handleKo(_ text: String, isFinal: Bool, range: CMTimeRange) {
         guard let lane = ko, !lane.isStale(range), koState != .idle else { return }
+        if range.isValid, range.end > lane.seenEnd { lane.seenEnd = range.end }
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if isFinal { log("[ENGINE] ko final: \(t)"); if !t.isEmpty { koFinals.append(t) }; koVolatile = "" } else { koVolatile = t }
         if koState == .collecting {
@@ -418,24 +515,20 @@ final class LiveListeningEngine: ListeningEngine {
 
     // MARK: Lifecycle
 
-    /// Sink + mic for the current mode. Mic is on only for .partner / .me.
+    /// Sink for the current mode. The mic is never touched here: it runs whenever the engine is live.
     private func applyMode() {
         feeder.setSink(mode == .partner ? .zh : mode == .me ? .ko : .none)
-        switch mode {
-        case .partner, .me: ensureAudio()
-        case .idle: retryTask?.cancel(); feeder.stopEngine()
-        case .paused: break
-        }
     }
 
-    private func ensureAudio() {
-        guard running, mode == .partner || mode == .me else { return }
-        do { try feeder.restart() }
-        catch {
-            log("[ENGINE] audio start failed: \(error)")
-            try? AudioSessionSetup.activate()
-            do { try feeder.restart() }
-            catch { scheduleAudioRetry() }
+    /// Starts / revives the mic on the feeder's audio queue; returns at once. Failures hop back here and retry.
+    private func ensureAudio(reactivate: Bool = false) {
+        guard running, mode != .paused else { return }
+        feeder.start(reactivate: reactivate) { [weak self] error in
+            guard let error else { return }
+            Task { @MainActor in
+                self?.log("[ENGINE] audio start failed (retrying): \(error)")
+                self?.scheduleAudioRetry()
+            }
         }
     }
 
@@ -460,7 +553,7 @@ final class LiveListeningEngine: ListeningEngine {
             catch { log("[ENGINE] start failed: \(error)"); retry = true }
             guard gen == startGen else { return } // torn down meanwhile; a newer start owns the flags
             starting = false
-            if running { applyMode() }
+            if running { ensureAudio(); applyMode() }
             else if retry, mode != .paused {
                 try? await Task.sleep(for: .seconds(Self.startRetryDelay))
                 if gen == startGen, mode != .paused { startIfNeeded() }
@@ -506,7 +599,7 @@ final class LiveListeningEngine: ListeningEngine {
         partnerQueue = qc
         partnerWorker = Task { await runPartnerWorker(q) }
 
-        // Lanes only: the mic starts in applyMode() when the mode needs it.
+        // Lanes only: the mic starts via ensureAudio() once running.
         feeder.configure(zh: (zhLane.cont, zhLane.format), ko: (koLane.cont, koLane.format)) { [weak self] t in
             Task { @MainActor in self?.endpoint(t) }
         }
@@ -536,10 +629,6 @@ final class LiveListeningEngine: ListeningEngine {
     /// Debounced: at most one restart per 0.5 s, with one trailing restart for notifications that arrive inside the window.
     private func restartAudio(reactivate: Bool) {
         guard running, mode != .paused else { return }
-        if mode == .idle { // mic stays off; just revive the session after an interruption
-            if reactivate { try? AudioSessionSetup.activate() }
-            return
-        }
         let wait = 0.5 - Date().timeIntervalSince(lastRestart)
         if wait > 0 && !reactivate {
             guard !restartPending else { return }
@@ -548,10 +637,7 @@ final class LiveListeningEngine: ListeningEngine {
             return
         }
         lastRestart = Date()
-        do {
-            if reactivate { try AudioSessionSetup.activate() } // interruption ended / app returned: session may be deactivated
-            try feeder.restart()
-        } catch { log("[ENGINE] audio restart failed: \(error)"); scheduleAudioRetry() }
+        ensureAudio(reactivate: reactivate)
     }
 
     private func teardown() {

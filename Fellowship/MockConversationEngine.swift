@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Engine contracts (stage 2 supplies real implementations)
 
-enum ListenMode { case partner /* zh-TW listening */, me /* ko-KR while button held */, idle /* listening OFF: engine prepared, mic off */, paused /* full teardown */ }
+enum ListenMode { case partner /* zh-TW listening */, me /* ko-KR while button held */, idle /* listening OFF: mic keeps running but audio is discarded */, paused /* full teardown */ }
 
 enum ListenEvent: Sendable {
     case partnerPartial(String)
@@ -17,7 +17,7 @@ protocol ListeningEngine {
     /// One stream per start(); call again after setMode(.paused) to restart.
     func events() -> AsyncStream<ListenEvent>
     /// .partner: listen to partner (resumes a paused line). .me: pause the partner line, recognise my speech.
-    /// .idle: listening off, mic off, engine stays prepared (.me still works). .paused: full teardown, drop in-flight lines.
+    /// .idle: listening off, mic keeps running but audio is discarded (.me still works, with 0.5 s pre-roll). .paused: full teardown, drop in-flight lines.
     func setMode(_ mode: ListenMode)
     /// Button released. Invalid press: discard my speech, resume the paused partner line.
     /// Valid: drop the partner line, translate, then emit myFinal or myFailed; back to partner mode.
