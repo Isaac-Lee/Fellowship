@@ -66,6 +66,10 @@ final class ConversationViewModel {
     var voiceEnabled = true {
         didSet { if !voiceEnabled { silence() } }
     }
+    #if DEBUG
+    /// Test aid: speak through the loud speaker without earphones. Never persisted; off on every launch.
+    var speakerTestMode = false { didSet { applySpeakerOverride() } }
+    #endif
     var speakQueue: [String] = []
     var pendingSpeechCount: Int { speakQueue.count }
     var speechRate: Float { Self.rate(forQueueLength: speakQueue.count) }
@@ -228,7 +232,12 @@ final class ConversationViewModel {
     func replay(_ message: Message) { enqueueSpeech(message.translation) }
 
     private func enqueueSpeech(_ text: String) {
-        guard voiceEnabled && earphonesConnected else { return }
+        #if DEBUG
+        let allowed = earphonesConnected || speakerTestMode
+        #else
+        let allowed = earphonesConnected
+        #endif
+        guard voiceEnabled && allowed else { return }
         speakQueue.append(text)
         speakNext()
     }
@@ -262,9 +271,14 @@ final class ConversationViewModel {
         earphonesConnected = connected
         showUnpluggedBanner = !connected
         if !connected { silence() }
+        #if DEBUG
+        applySpeakerOverride()
+        #endif
     }
 
     #if DEBUG
+    /// Speaker only while test mode is on and no earphones; the override emits .override route changes, which the monitor ignores (wired/input unchanged).
+    private func applySpeakerOverride() { AudioSessionSetup.setSpeakerOverride(speakerTestMode && !earphonesConnected) }
     private var mock: MockConversationEngine? { listening as? MockConversationEngine }
     func simulateUnplug() { earphonesDidChange(connected: false) }
     func simulateReplug() { earphonesDidChange(connected: true) }

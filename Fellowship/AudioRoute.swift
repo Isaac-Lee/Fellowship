@@ -12,6 +12,12 @@ enum AudioSessionSetup {
         applyPreferredInput()
     }
 
+    #if DEBUG
+    static func setSpeakerOverride(_ on: Bool) {
+        try? AVAudioSession.sharedInstance().overrideOutputAudioPort(on ? .speaker : .none)
+    }
+    #endif
+
     /// Wired headset/USB mic if present; nil clears the preference (built-in mic).
     static func applyPreferredInput() {
         let s = AVAudioSession.sharedInstance()

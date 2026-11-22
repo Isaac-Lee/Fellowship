@@ -10,6 +10,7 @@ struct DebugMenu: View {
             Button(vm.earphonesConnected ? "이어폰 빠짐" : "이어폰 꽂음") {
                 vm.earphonesConnected ? vm.simulateUnplug() : vm.simulateReplug()
             }
+            Toggle("테스트: 스피커로 듣기", isOn: $vm.speakerTestMode)
             Button("다음 인식 실패") { vm.simulateRecognitionFailure() }
             Button("언어 데이터 없음") { vm.simulateMissingLanguageData() }
             Button("문장 밀림") { vm.simulateBacklog() }

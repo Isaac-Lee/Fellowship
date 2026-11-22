@@ -45,6 +45,7 @@ struct ConversationView: View {
             Text(vm.earphonesConnected ? "🎧 이어폰 연결됨" : "🎧 이어폰 연결 안 됨").font(.subheadline.weight(.medium))
             Spacer()
             #if DEBUG
+            if vm.speakerTestMode { Text("스피커 테스트").font(.caption2).foregroundStyle(.secondary) }
             Text("속도 \(vm.speechRate, specifier: "%.2f") · 대기 \(vm.pendingSpeechCount)")
                 .font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
             DebugMenu(vm: vm)

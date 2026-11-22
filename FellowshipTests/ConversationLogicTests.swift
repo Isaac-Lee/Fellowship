@@ -101,4 +101,18 @@ struct ConversationLogicTests {
         vm.handle(.partnerFinal(zh: "x", ko: "넷"))
         #expect(speech.spoken.map(\.text) == ["하나", "넷"])
     }
+
+    #if DEBUG
+    @Test func speakerTestModeSpeaksWithoutEarphones() {
+        let speech = FakeSpeech()
+        let vm = makeVM(speech)
+        vm.earphonesConnected = false
+        vm.handle(.partnerFinal(zh: "x", ko: "하나"))
+        #expect(speech.spoken.isEmpty)
+        vm.speakerTestMode = true
+        vm.handle(.partnerFinal(zh: "x", ko: "둘"))
+        #expect(speech.spoken.map(\.text) == ["둘"])
+        vm.speakerTestMode = false
+    }
+    #endif
 }
