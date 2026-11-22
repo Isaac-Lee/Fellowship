@@ -2,6 +2,8 @@ import SwiftUI
 
 struct ConversationView: View {
     @Bindable var vm: ConversationViewModel
+    @Environment(\.verticalSizeClass) private var vSize
+    private var landscape: Bool { vSize == .compact }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -9,14 +11,22 @@ struct ConversationView: View {
             if vm.showUnpluggedBanner {
                 Text("이어폰이 빠져서 음성을 껐어요")
                     .font(.headline).foregroundStyle(.black)
-                    .frame(maxWidth: .infinity).padding(10)
+                    .frame(maxWidth: .infinity).padding(landscape ? 4 : 10)
                     .background(Color.yellow)
             }
-            messageList
-            talkArea
+            if landscape {
+                HStack(spacing: 0) {
+                    messageList
+                    talkArea.containerRelativeFrame(.horizontal) { w, _ in w * 0.38 }
+                }
+            } else {
+                messageList
+                talkArea
+            }
         }
         .sensoryFeedback(.impact, trigger: vm.isHoldingToTalk) { _, now in now }
         .sensoryFeedback(.success, trigger: vm.successCount)
+        .onChange(of: landscape) { vm.cancelPress() }
         .fullScreenCover(item: $vm.showCard) { ShowCardView(message: $0) }
         .animation(.default, value: vm.showUnpluggedBanner)
     }
@@ -33,7 +43,7 @@ struct ConversationView: View {
             Toggle("음성 끄기", isOn: Binding(get: { !vm.voiceEnabled }, set: { vm.voiceEnabled = !$0 }))
                 .fixedSize()
         }
-        .padding(.horizontal).padding(.vertical, 8)
+        .padding(.horizontal).padding(.vertical, landscape ? 2 : 8)
     }
 
     private var messageList: some View {
@@ -73,14 +83,16 @@ struct ConversationView: View {
 
     private var talkArea: some View {
         VStack(spacing: 8) {
+            if landscape { Spacer(minLength: 0) }
             if vm.retryHint { Text("다시 말해 주세요").font(.headline).foregroundStyle(.orange) }
             if vm.isHoldingToTalk {
                 Text("● 듣는 중…").font(.headline).foregroundStyle(.red)
                 Text(vm.myPartial).font(.title3).foregroundStyle(.secondary).frame(minHeight: 28)
+                    .lineLimit(landscape ? 3 : nil)
             }
             Text(vm.isHoldingToTalk ? "손을 떼면 번역해요" : "🎤 누르고 말하기")
                 .font(.title.bold()).foregroundStyle(.white)
-                .frame(maxWidth: .infinity, minHeight: 88)
+                .frame(maxWidth: .infinity, minHeight: 88, maxHeight: landscape ? .infinity : 88)
                 .background(vm.isHoldingToTalk ? Color.red : Color.blue, in: .rect(cornerRadius: 24))
                 .onLongPressGesture(minimumDuration: .infinity, maximumDistance: 200, perform: {},
                                     onPressingChanged: { $0 ? vm.pressBegan() : vm.pressEnded() })
@@ -100,6 +112,17 @@ struct ConversationView: View {
     ]
     vm.partnerPartial = "這邊請，菜單"
     vm.earphonesConnected = false
+    vm.showUnpluggedBanner = true
+    return ConversationView(vm: vm)
+}
+
+#Preview("가로", traits: .landscapeLeft) {
+    let vm = ConversationViewModel()
+    vm.messages = [
+        Message(speaker: .partner, original: "歡迎光臨！請問幾位？", translation: "어서 오세요! 몇 분이세요?"),
+        Message(speaker: .me, original: "화장실이 어디예요?", translation: "請問洗手間在哪裡？"),
+    ]
+    vm.partnerPartial = "這邊請，菜單"
     vm.showUnpluggedBanner = true
     return ConversationView(vm: vm)
 }

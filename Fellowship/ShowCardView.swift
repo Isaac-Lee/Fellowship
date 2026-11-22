@@ -11,8 +11,10 @@ struct ShowCardView: View {
                 Text(message.translation)
                     .font(.system(size: 160, weight: .bold))
                     .minimumScaleFactor(0.1)
+                    .lineLimit(3)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .multilineTextAlignment(.center)
-                Text(message.original).font(.title3).foregroundStyle(.secondary)
+                Text(message.original).font(.title3).lineLimit(2).foregroundStyle(.secondary)
             }
             .padding(32)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -30,5 +32,9 @@ struct ShowCardView: View {
 }
 
 #Preview {
+    ShowCardView(message: Message(speaker: .me, original: "화장실이 어디예요?", translation: "請問洗手間在哪裡？"))
+}
+
+#Preview("가로", traits: .landscapeLeft) {
     ShowCardView(message: Message(speaker: .me, original: "화장실이 어디예요?", translation: "請問洗手間在哪裡？"))
 }

@@ -238,7 +238,7 @@
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "상대의 말과 내 말을 듣고 번역하려면 마이크가 필요해요.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "말을 글자로 바꾸려면 음성 인식 권한이 필요해요.";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -257,7 +257,7 @@
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "상대의 말과 내 말을 듣고 번역하려면 마이크가 필요해요.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "말을 글자로 바꾸려면 음성 인식 권한이 필요해요.";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
