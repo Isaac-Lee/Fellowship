@@ -4,6 +4,7 @@ import Translation
 import AVFoundation
 import CoreMedia
 import os
+import Accelerate
 
 /// Mic -> converted buffers for the active lane, plus RMS endpointing. Not isolated: the tap runs on an audio thread.
 final class LiveMicFeeder: @unchecked Sendable {
@@ -15,8 +16,12 @@ final class LiveMicFeeder: @unchecked Sendable {
         var koCont: AsyncStream<AnalyzerInput>.Continuation?
         var zhTarget: AVAudioFormat?
         var koTarget: AVAudioFormat?
-        var inFrames: Int64 = 0            // running timeline in input frames (continuous across sink switches)
-        var zhEnd = CMTime.zero            // end of last buffer fed to each lane
+        var timeline = 0.0                 // monotonic seconds of audio seen; independent of the input sample rate
+        var zhFrames: Int64 = 0            // lane clocks, in output frames at each lane's target rate
+        var koFrames: Int64 = 0
+        var zhStamps = 0                   // DEBUG: stamps logged since last (re)start
+        var koStamps = 0
+        var zhEnd = CMTime.zero            // lane-clock end of last buffer fed to each lane
         var koEnd = CMTime.zero
         var speechSeen = false
         var silence: TimeInterval = 0
@@ -45,10 +50,14 @@ final class LiveMicFeeder: @unchecked Sendable {
     }
 
     /// Reinstall the tap (after a config change / interruption). Lanes and timeline stay.
+    /// No-op if the engine is still running at the same input rate.
     func restart() throws {
+        if engine.isRunning, engine.inputNode.outputFormat(forBus: 0).sampleRate == tapRate { return }
         stopEngine()
         try startEngine()
     }
+    private var tapRate = 0.0
+    private var restarts = 0
 
     func stop() {
         stopEngine()
@@ -63,6 +72,12 @@ final class LiveMicFeeder: @unchecked Sendable {
         converters = [:]
         if let zt, let c = AVAudioConverter(from: inFmt, to: zt) { converters[.zh] = c }
         if let kt, let c = AVAudioConverter(from: inFmt, to: kt) { converters[.ko] = c }
+        tapRate = inFmt.sampleRate
+        state.withLock { $0.zhStamps = 0; $0.koStamps = 0 }
+        restarts += 1
+        #if DEBUG
+        print("[AUDIO] engine restart #\(restarts) inputRate=\(inFmt.sampleRate)")
+        #endif
         input.installTap(onBus: 0, bufferSize: 2048, format: inFmt) { @Sendable [self] buf, _ in
             handle(buf, inFmt: inFmt)
         }
@@ -79,28 +94,22 @@ final class LiveMicFeeder: @unchecked Sendable {
         guard buf.frameLength > 0 else { return }
         var rms: Float = 0
         if let ch = buf.floatChannelData?[0] {
-            var sum: Float = 0
-            for i in 0..<Int(buf.frameLength) { sum += ch[i] * ch[i] }
-            rms = (sum / Float(buf.frameLength)).squareRoot()
+            vDSP_rmsqv(ch, 1, &rms, vDSP_Length(buf.frameLength))
         }
-        let rate = Int32(inFmt.sampleRate)
         let dur = Double(buf.frameLength) / inFmt.sampleRate
         let voiced = rms > LiveListeningEngine.voiceRMSThreshold
 
-        // Update timeline + endpoint decision under the lock; do the slow work outside.
-        let frames = Int64(buf.frameLength)
-        let (sink, start, cont, endpoint): (Sink, CMTime, AsyncStream<AnalyzerInput>.Continuation?, CMTime?) = state.withLock { s in
+        // Wall timeline + endpoint decision under the lock; lane stamps are assigned after conversion.
+        let (sink, wall, cont, endpoint): (Sink, Double, AsyncStream<AnalyzerInput>.Continuation?, CMTime?) = state.withLock { s in
             var endpoint: CMTime?
-            let start = CMTime(value: s.inFrames, timescale: rate)
-            s.inFrames += frames
-            let end = CMTime(value: s.inFrames, timescale: rate)
-            if voiced { s.lastVoiceDate = Date(); s.lastVoicedEnd = end; s.silence = 0; s.speechSeen = true }
+            let wall = s.timeline
+            s.timeline += dur
+            if voiced { s.lastVoiceDate = Date(); s.silence = 0; s.speechSeen = true }
             else if s.speechSeen { s.silence += dur }
             if s.sink == .zh, s.speechSeen, !voiced, s.silence >= LiveListeningEngine.silenceToFinalize {
-                endpoint = s.lastVoicedEnd; s.speechSeen = false; s.silence = 0
+                endpoint = s.lastVoicedEnd; s.speechSeen = false; s.silence = 0 // already in lane-clock time
             }
-            if s.sink == .zh { s.zhEnd = end } else if s.sink == .ko { s.koEnd = end }
-            return (s.sink, start, s.sink == .zh ? s.zhCont : s.sink == .ko ? s.koCont : nil, endpoint)
+            return (s.sink, wall, s.sink == .zh ? s.zhCont : s.sink == .ko ? s.koCont : nil, endpoint)
         }
         if let endpoint { onEndpoint?(endpoint) }
         guard sink != .none, let cont, let conv = converters[sink] else { return }
@@ -115,7 +124,29 @@ final class LiveMicFeeder: @unchecked Sendable {
             status.pointee = .haveData
             return buf
         }
-        if err == nil, out.frameLength > 0 { cont.yield(AnalyzerInput(buffer: out, bufferStartTime: start)) }
+        guard err == nil, out.frameLength > 0 else { return }
+
+        // Lane clock in OUTPUT frames: the converter buffers, so out.frameLength != input duration.
+        // Jumps forward to the wall timeline when the lane was idle, never backward.
+        let rate = target.sampleRate
+        let outFrames = Int64(out.frameLength)
+        let ts = Int32(rate)
+        let (start, logIt): (CMTime, Bool) = state.withLock { s in
+            var frames = sink == .zh ? s.zhFrames : s.koFrames
+            frames = max(frames, Int64(wall * rate))
+            let start = CMTime(value: frames, timescale: ts)
+            frames += outFrames
+            let end = CMTime(value: frames, timescale: ts)
+            var n = sink == .zh ? s.zhStamps : s.koStamps
+            let logIt = n < 3; n += 1
+            if sink == .zh { s.zhFrames = frames; s.zhEnd = end; s.zhStamps = n } else { s.koFrames = frames; s.koEnd = end; s.koStamps = n }
+            if voiced { s.lastVoicedEnd = end }
+            return (start, logIt)
+        }
+        #if DEBUG
+        if logIt { print("[AUDIO] stamp \(sink == .zh ? "zh" : "ko") start=\(start.seconds) dur=\(Double(out.frameLength) / rate)") }
+        #endif
+        cont.yield(AnalyzerInput(buffer: out, bufferStartTime: start))
     }
 }
 
@@ -164,6 +195,9 @@ final class LiveListeningEngine: ListeningEngine {
     private var koState = KoState.idle
     private var koFinals: [String] = []
     private var koVolatile = ""
+    private var lastPartnerPartial = "", lastMyPartial = ""
+    private var lastRestart = Date.distantPast
+    private var restartPending = false
     private var observers: [NSObjectProtocol] = []
 
     // MARK: ListeningEngine
@@ -182,7 +216,7 @@ final class LiveListeningEngine: ListeningEngine {
         case .partner:
             if running { applySink() } else { startIfNeeded() }
         case .me:
-            koFinals = []; koVolatile = ""; koState = .collecting
+            koFinals = []; koVolatile = ""; lastMyPartial = ""; koState = .collecting
             applySink()
         }
     }
@@ -216,15 +250,29 @@ final class LiveListeningEngine: ListeningEngine {
         let tFinal = Date()
         guard !text.isEmpty else { continuation?.yield(.myFailed); return }
         do {
-            guard let s = koToZh else { throw NSError(domain: "LiveListeningEngine", code: 2) }
-            nonisolated(unsafe) let sess = s // SDK hands a MainActor session to a @concurrent method
-            let r = try await sess.translate(text)
-            continuation?.yield(.myFinal(ko: text, zh: r.targetText))
+            let zhText = try await translate(text, partner: false)
+            continuation?.yield(.myFinal(ko: text, zh: zhText))
             log("[LAT] mine voiceEnd→final \(ms(from: released, to: tFinal)) →translated \(ms(from: released, to: Date()))")
         } catch {
-            log("[ENGINE] ko→zh translate failed: \(error)")
+            log("[ENGINE] translate failed: ko→zh \(error)")
             continuation?.yield(.myFailed)
         }
+    }
+
+    /// partner: zh→ko (serial partner worker), else ko→zh (my turn). Each direction has its own session.
+    /// CancellationError (seen when another translation consumer is active) is retried once on a fresh session.
+    private func translate(_ text: String, partner: Bool) async throws -> String {
+        for attempt in 0..<2 {
+            guard let s = partner ? zhToKo : koToZh else { throw NSError(domain: "LiveListeningEngine", code: 2) }
+            nonisolated(unsafe) let sess = s // SDK hands a MainActor session to a @concurrent method
+            do { return try await sess.translate(text).targetText }
+            catch is CancellationError where attempt == 0 && !Task.isCancelled {
+                log("[ENGINE] translate failed: CancellationError, retrying with a fresh session")
+                if partner { zhToKo = TranslationSession(installedSource: zhHant, target: koLang) }
+                else { koToZh = TranslationSession(installedSource: koLang, target: zhHant) }
+            }
+        }
+        throw CancellationError()
     }
 
     // MARK: Results
@@ -233,31 +281,29 @@ final class LiveListeningEngine: ListeningEngine {
         guard zh?.dropping == false else { return }
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
-        if isFinal { partnerQueue?.yield((t, feeder.lastVoiceDate)) }
-        else { continuation?.yield(.partnerPartial(t)) }
+        if isFinal { log("[ENGINE] zh final: \(t)"); lastPartnerPartial = ""; partnerQueue?.yield((t, feeder.lastVoiceDate)) }
+        else if t != lastPartnerPartial { lastPartnerPartial = t; continuation?.yield(.partnerPartial(t)) }
     }
 
     private func handleKo(_ text: String, isFinal: Bool) {
         guard ko?.dropping == false, koState != .idle else { return }
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if isFinal { if !t.isEmpty { koFinals.append(t) }; koVolatile = "" } else { koVolatile = t }
+        if isFinal { log("[ENGINE] ko final: \(t)"); if !t.isEmpty { koFinals.append(t) }; koVolatile = "" } else { koVolatile = t }
         if koState == .collecting {
             let all = (koFinals + [koVolatile]).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !all.isEmpty { continuation?.yield(.myPartial(all)) }
+            if !all.isEmpty, all != lastMyPartial { lastMyPartial = all; continuation?.yield(.myPartial(all)) }
         }
     }
 
     private func runPartnerWorker(_ queue: AsyncStream<(text: String, voice: Date)>) async {
         for await item in queue { // sequential: sentences stay in order even if translations are slow
             let tFinal = Date()
-            guard let s = zhToKo else { continue }
             do {
-                nonisolated(unsafe) let sess = s
-                let r = try await sess.translate(item.text)
+                let ko = try await translate(item.text, partner: true)
                 if Task.isCancelled { return }
-                continuation?.yield(.partnerFinal(zh: item.text, ko: r.targetText))
+                continuation?.yield(.partnerFinal(zh: item.text, ko: ko))
                 log("[LAT] partner speechEnd→final \(ms(from: item.voice, to: tFinal)) →translated \(ms(from: item.voice, to: Date()))")
-            } catch { log("[ENGINE] zh→ko translate failed: \(error)") }
+            } catch { log("[ENGINE] translate failed: zh→ko \(error)") }
         }
     }
 
@@ -312,7 +358,7 @@ final class LiveListeningEngine: ListeningEngine {
         try feeder.start(zh: (zhLane.cont, zhLane.format), ko: (koLane.cont, koLane.format)) { [weak self] t in
             Task { @MainActor in self?.endpoint(t) }
         }
-        observers = Self.observe { @MainActor [weak self] in self?.restartAudio() }
+        observers = Self.observe { @MainActor [weak self] reactivate in self?.restartAudio(reactivate: reactivate) }
     }
 
     private func makeLane(_ loc: Locale) async throws -> Lane {
@@ -332,10 +378,21 @@ final class LiveListeningEngine: ListeningEngine {
         Task { try? await zh.analyzer.finalize(through: t) }
     }
 
-    private func restartAudio() {
+    /// Debounced: at most one restart per 0.5 s, with one trailing restart for notifications that arrive inside the window.
+    private func restartAudio(reactivate: Bool) {
         guard running, mode != .paused else { return }
-        do { try AudioSessionSetup.activate(); try feeder.restart() }
-        catch { log("[ENGINE] audio restart failed: \(error)") }
+        let wait = 0.5 - Date().timeIntervalSince(lastRestart)
+        if wait > 0 && !reactivate {
+            guard !restartPending else { return }
+            restartPending = true
+            Task { try? await Task.sleep(for: .seconds(wait)); restartPending = false; restartAudio(reactivate: false) }
+            return
+        }
+        lastRestart = Date()
+        do {
+            if reactivate { try AudioSessionSetup.activate() } // interruption ended: session was deactivated
+            try feeder.restart()
+        } catch { log("[ENGINE] audio restart failed: \(error)") }
     }
 
     private func teardown() {
@@ -351,6 +408,7 @@ final class LiveListeningEngine: ListeningEngine {
             Task { await a.cancelAndFinishNow() }
         }
         zh = nil; ko = nil; zhToKo = nil; koToZh = nil
+        lastPartnerPartial = ""; lastMyPartial = ""; restartPending = false
         koState = .idle; koFinals = []; koVolatile = ""
         running = false
     }
@@ -361,12 +419,13 @@ final class LiveListeningEngine: ListeningEngine {
     }
 
     // Notification observers are built in a nonisolated context: they fire on arbitrary threads.
-    nonisolated private static func observe(_ hop: @escaping @Sendable @MainActor () -> Void) -> [NSObjectProtocol] {
+    nonisolated private static func observe(_ hop: @escaping @Sendable @MainActor (_ reactivate: Bool) -> Void) -> [NSObjectProtocol] {
         [.AVAudioEngineConfigurationChange, AVAudioSession.interruptionNotification].map { name in
             NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { @Sendable note in
                 if name == AVAudioSession.interruptionNotification,
                    (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) != AVAudioSession.InterruptionType.ended.rawValue { return }
-                Task { @MainActor in hop() }
+                let reactivate = name == AVAudioSession.interruptionNotification
+                Task { @MainActor in hop(reactivate) }
             }
         }
     }

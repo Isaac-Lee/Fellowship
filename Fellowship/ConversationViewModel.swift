@@ -204,12 +204,12 @@ final class ConversationViewModel {
 
     func handle(_ event: ListenEvent) {
         switch event {
-        case .partnerPartial(let s): partnerPartial = s
+        case .partnerPartial(let s): if partnerPartial != s { partnerPartial = s }
         case .partnerFinal(let zh, let ko):
             partnerPartial = nil
             messages.append(Message(speaker: .partner, original: zh, translation: ko))
             enqueueSpeech(ko)
-        case .myPartial(let s): if isHoldingToTalk { myPartial = s }
+        case .myPartial(let s): if isHoldingToTalk, myPartial != s { myPartial = s }
         case .myFinal(let ko, let zh):
             isTranslating = false
             myPartial = ""
