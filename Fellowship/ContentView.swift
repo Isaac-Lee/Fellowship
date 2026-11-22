@@ -17,7 +17,14 @@ struct ContentView: View {
         #if DEBUG
         .sheet(isPresented: $showProbe) { EngineProbeView(autoRun: true) }
         #endif
-        .onChange(of: scenePhase) { scenePhase == .active ? vm.refreshReadiness() : vm.cancelPress() }
+        .onChange(of: scenePhase) {
+            if scenePhase == .active {
+                vm.refreshReadiness()
+                if !vm.showSetup { vm.resume() }
+            } else {
+                vm.appDidLeaveActive()
+            }
+        }
     }
 }
 

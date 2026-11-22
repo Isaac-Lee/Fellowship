@@ -4,9 +4,12 @@ import AVFoundation
 @MainActor
 final class SpeechSynthesizerOutput: NSObject, SpeechOutput, AVSpeechSynthesizerDelegate {
     private let synth = AVSpeechSynthesizer()
-    private var current: (id: ObjectIdentifier, onFinish: @MainActor () -> Void)?
+    private var current: (u: AVSpeechUtterance, onFinish: @MainActor () -> Void)?
+    private var voice: AVSpeechSynthesisVoice?
+    private var watchdog: Task<Void, Never>?
 
     override init() {
+        voice = Self.bestKoreanVoice()
         super.init()
         synth.usesApplicationAudioSession = true
         synth.delegate = self
@@ -18,30 +21,46 @@ final class SpeechSynthesizerOutput: NSObject, SpeechOutput, AVSpeechSynthesizer
             ?? AVSpeechSynthesisVoice(language: "ko-KR")
     }
 
+    /// Call when the app becomes active: the user may have downloaded a better voice.
+    func refreshVoice() { voice = Self.bestKoreanVoice() }
+
     func speak(_ text: String, rate: Float, onFinish: @escaping @MainActor () -> Void) {
         let u = AVSpeechUtterance(string: text)
-        u.voice = Self.bestKoreanVoice()
+        u.voice = voice
         u.rate = rate
-        current = (ObjectIdentifier(u), onFinish)
+        current = (u, onFinish)
         synth.speak(u)
+        // Watchdog: a lost didFinish (interruption, route change) must not stall the queue forever.
+        let limit = Double(text.count) * 0.25 / max(Double(rate) / 0.5, 0.5) + 3
+        watchdog?.cancel()
+        watchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(limit))
+            guard !Task.isCancelled, let self, self.current?.u === u else { return }
+            let c = self.current
+            self.current = nil
+            self.synth.stopSpeaking(at: .immediate) // didCancel finds no match
+            c?.onFinish()
+        }
     }
 
     func stopImmediately() {
+        watchdog?.cancel()
         current = nil // suppresses onFinish
         synth.stopSpeaking(at: .immediate)
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        let id = ObjectIdentifier(utterance)
+        nonisolated(unsafe) let u = utterance
         Task { @MainActor in
-            guard let c = current, c.id == id else { return }
+            guard let c = current, c.u === u else { return }
             current = nil
+            watchdog?.cancel()
             c.onFinish()
         }
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        let id = ObjectIdentifier(utterance)
-        Task { @MainActor in if current?.id == id { current = nil } } // no onFinish
+        nonisolated(unsafe) let u = utterance
+        Task { @MainActor in if current?.u === u { current = nil; watchdog?.cancel() } } // no onFinish
     }
 }

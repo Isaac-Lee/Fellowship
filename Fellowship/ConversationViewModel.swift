@@ -55,6 +55,8 @@ final class ConversationViewModel {
     var messages: [Message] = []
     var partnerPartial: String?
     var isHoldingToTalk = false
+    /// 듣기 on/off. Not persisted: every launch starts off.
+    var isListening = false
     var myPartial = ""
     var retryHint = false
     var showCard: Message?
@@ -68,13 +70,22 @@ final class ConversationViewModel {
     }
     #if DEBUG
     /// Test aid: speak through the loud speaker without earphones. Never persisted; off on every launch.
-    var speakerTestMode = false { didSet { applySpeakerOverride() } }
+    var speakerTestMode = false {
+        didSet {
+            applySpeakerOverride()
+            if !speakerTestMode && !earphonesConnected { silence() }
+        }
+    }
+    /// Seam: tests replace this so the real audio session is never touched.
+    @ObservationIgnored var speakerOverride: (Bool) -> Void = { AudioSessionSetup.setSpeakerOverride($0) }
     #endif
     var speakQueue: [String] = []
     var pendingSpeechCount: Int { speakQueue.count }
     var speechRate: Float { Self.rate(forQueueLength: speakQueue.count) }
 
-    @ObservationIgnored private let listening: ListeningEngine
+    @ObservationIgnored private var listening: ListeningEngine
+    /// Seam for press-duration tests.
+    @ObservationIgnored var now: () -> Date = { .now }
     @ObservationIgnored private let checker: ReadinessChecker
     @ObservationIgnored private let speech: SpeechOutput
     @ObservationIgnored private var pressStart: Date?
@@ -83,6 +94,7 @@ final class ConversationViewModel {
     @ObservationIgnored private var speechGeneration = 0
     @ObservationIgnored private var eventsTask: Task<Void, Never>?
     @ObservationIgnored private var retryTask: Task<Void, Never>?
+    @ObservationIgnored private var backstopTask: Task<Void, Never>?
     @ObservationIgnored private var routeMonitor: AudioRouteMonitor?
     @ObservationIgnored private var routeKnown = false
 
@@ -90,6 +102,7 @@ final class ConversationViewModel {
         self.listening = listening
         self.checker = checker
         self.speech = speech
+        self.listening.onInterruptionBegan = { [weak self] in self?.silence() }
         refreshReadiness()
     }
 
@@ -103,7 +116,7 @@ final class ConversationViewModel {
         #endif
         let engine = LiveListeningEngine()
         self.init(listening: engine, checker: LiveReadinessChecker(), speech: SpeechSynthesizerOutput())
-        engine.onMissingData = { [weak self] in self?.refreshReadiness() }
+        engine.onMissingData = { [weak self] in self?.refreshReadiness(confirmed: true) }
         routeMonitor = AudioRouteMonitor { [weak self] connected in self?.routeChanged(connected: connected) }
     }
 
@@ -130,13 +143,34 @@ final class ConversationViewModel {
 
     // MARK: Setup actions
     /// Called at launch and when the app becomes active; stage 2 detects missing data here.
-    func refreshReadiness() {
-        apply(checker.readyKinds()) // cached value now, fresh value after refresh()
+    /// A failing result while setup is done must repeat once ~1 s later before we go back to setup,
+    /// unless `confirmed` (the engine itself reported missing data).
+    func refreshReadiness(confirmed: Bool = false) {
+        applyUnlessTransient(checker.readyKinds()) // cached value now, fresh value after refresh()
         Task {
             await checker.refresh()
-            apply(checker.readyKinds())
+            var ready = checker.readyKinds()
+            if hasCompletedSetup && ready.count < ReadinessKind.allCases.count && !confirmed {
+                try? await Task.sleep(for: .seconds(1))
+                await checker.refresh()
+                ready = checker.readyKinds()
+            }
+            apply(ready)
             if hasCompletedSetup && !allReady { hasCompletedSetup = false } // data went missing: re-confirm
         }
+    }
+    /// Completed setup + a failing value is not shown until it is confirmed.
+    private func applyUnlessTransient(_ ready: Set<ReadinessKind>) {
+        if hasCompletedSetup && ready.count < ReadinessKind.allCases.count { return }
+        apply(ready)
+    }
+    func resume() { listening.resume() }
+    /// Scene left .active: drop the press and any speech.
+    func appDidLeaveActive() { cancelPress(); silence() }
+    func toggleListening() {
+        isListening.toggle()
+        if !isListening { partnerPartial = nil }
+        listening.setMode(isListening ? .partner : .idle)
     }
     private func apply(_ ready: Set<ReadinessKind>) {
         for kind in ReadinessKind.allCases { readiness[kind: kind].isReady = ready.contains(kind) }
@@ -155,7 +189,7 @@ final class ConversationViewModel {
     // MARK: Press to talk
     func pressBegan() {
         guard !isHoldingToTalk, !isTranslating else { return }
-        pressStart = Date()
+        pressStart = now()
         isHoldingToTalk = true
         retryHint = false
         myPartial = ""
@@ -165,8 +199,15 @@ final class ConversationViewModel {
     func pressEnded() {
         guard isHoldingToTalk else { return }
         isHoldingToTalk = false
-        let valid = Self.isValidPress(duration: Date().timeIntervalSince(pressStart ?? .now))
-        if valid { partnerPartial = nil; isTranslating = true } else { myPartial = "" }
+        let valid = Self.isValidPress(duration: now().timeIntervalSince(pressStart ?? now()))
+        if valid {
+            partnerPartial = nil; isTranslating = true
+            backstopTask?.cancel()
+            backstopTask = Task { // no myFinal/myFailed in 5 s: unblock the button
+                try? await Task.sleep(for: .seconds(5))
+                if !Task.isCancelled && isTranslating { isTranslating = false; myPartial = ""; showRetryHint() }
+            }
+        } else { myPartial = "" }
         listening.endMine(valid: valid)
     }
 
@@ -192,12 +233,13 @@ final class ConversationViewModel {
         guard eventsTask == nil else { return }
         let stream = listening.events()
         eventsTask = Task { for await e in stream { handle(e) } }
-        listening.setMode(.partner)
+        listening.setMode(isListening ? .partner : .idle)
     }
 
     func stop() {
         eventsTask?.cancel(); eventsTask = nil
-        retryTask?.cancel()
+        retryTask?.cancel(); backstopTask?.cancel()
+        isListening = false
         listening.setMode(.paused)
         silence()
         partnerPartial = nil
@@ -208,21 +250,21 @@ final class ConversationViewModel {
 
     func handle(_ event: ListenEvent) {
         switch event {
-        case .partnerPartial(let s): if partnerPartial != s { partnerPartial = s }
+        case .partnerPartial(let s): if isListening, partnerPartial != s { partnerPartial = s }
         case .partnerFinal(let zh, let ko):
             partnerPartial = nil
             messages.append(Message(speaker: .partner, original: zh, translation: ko))
             enqueueSpeech(ko)
         case .myPartial(let s): if isHoldingToTalk, myPartial != s { myPartial = s }
         case .myFinal(let ko, let zh):
-            isTranslating = false
+            isTranslating = false; backstopTask?.cancel()
             myPartial = ""
             let m = Message(speaker: .me, original: ko, translation: zh)
             messages.append(m)
             successCount += 1
             showCard = m
         case .myFailed:
-            isTranslating = false
+            isTranslating = false; backstopTask?.cancel()
             myPartial = ""
             showRetryHint()
         }
@@ -249,7 +291,7 @@ final class ConversationViewModel {
         speech.speak(text, rate: speechRate) { [weak self] in
             guard let self, generation == speechGeneration else { return }
             isSpeaking = false
-            speakQueue.removeFirst()
+            if !speakQueue.isEmpty { speakQueue.removeFirst() }
             speakNext()
         }
     }
@@ -272,13 +314,14 @@ final class ConversationViewModel {
         showUnpluggedBanner = !connected
         if !connected { silence() }
         #if DEBUG
+        if connected { speakerTestMode = false } // earphones back: test aid auto-off
         applySpeakerOverride()
         #endif
     }
 
     #if DEBUG
     /// Speaker only while test mode is on and no earphones; the override emits .override route changes, which the monitor ignores (wired/input unchanged).
-    private func applySpeakerOverride() { AudioSessionSetup.setSpeakerOverride(speakerTestMode && !earphonesConnected) }
+    private func applySpeakerOverride() { speakerOverride(speakerTestMode && !earphonesConnected) }
     private var mock: MockConversationEngine? { listening as? MockConversationEngine }
     func simulateUnplug() { earphonesDidChange(connected: false) }
     func simulateReplug() { earphonesDidChange(connected: true) }

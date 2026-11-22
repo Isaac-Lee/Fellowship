@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Engine contracts (stage 2 supplies real implementations)
 
-enum ListenMode { case partner /* zh-TW */, me /* ko-KR */, paused }
+enum ListenMode { case partner /* zh-TW listening */, me /* ko-KR while button held */, idle /* listening OFF: engine prepared, mic off */, paused /* full teardown */ }
 
 enum ListenEvent: Sendable {
     case partnerPartial(String)
@@ -17,11 +17,15 @@ protocol ListeningEngine {
     /// One stream per start(); call again after setMode(.paused) to restart.
     func events() -> AsyncStream<ListenEvent>
     /// .partner: listen to partner (resumes a paused line). .me: pause the partner line, recognise my speech.
-    /// .paused: stop everything and drop in-flight lines.
+    /// .idle: listening off, mic off, engine stays prepared (.me still works). .paused: full teardown, drop in-flight lines.
     func setMode(_ mode: ListenMode)
     /// Button released. Invalid press: discard my speech, resume the paused partner line.
     /// Valid: drop the partner line, translate, then emit myFinal or myFailed; back to partner mode.
+    /// After my turn the engine returns to the resting mode (.partner or .idle) the VM last set.
     func endMine(valid: Bool)
+    /// App became active: ensure audio is running for the current mode.
+    func resume()
+    var onInterruptionBegan: (@MainActor () -> Void)? { get set }
 }
 
 @MainActor
@@ -45,6 +49,9 @@ protocol ReadinessChecker {
 final class MockConversationEngine: ListeningEngine, ReadinessChecker {
     private var continuation: AsyncStream<ListenEvent>.Continuation?
     private var mode = ListenMode.paused
+    private var resting = ListenMode.idle
+    var onInterruptionBegan: (@MainActor () -> Void)?
+    func resume() {}
     private var partnerTask: Task<Void, Never>?
     private var myTask: Task<Void, Never>?
     private var line: (zh: String, ko: String)? // partner line in progress
@@ -70,7 +77,9 @@ final class MockConversationEngine: ListeningEngine, ReadinessChecker {
 
     func setMode(_ new: ListenMode) {
         mode = new
+        if new == .partner || new == .idle { resting = new }
         switch new {
+        case .idle: break // partner task keeps ticking but yields nothing
         case .partner:
             if partnerTask == nil { partnerTask = Task { await runPartner() } }
         case .me:
@@ -93,7 +102,7 @@ final class MockConversationEngine: ListeningEngine, ReadinessChecker {
 
     func endMine(valid: Bool) {
         myTask?.cancel()
-        mode = .partner
+        mode = resting
         guard valid else { return } // partner line resumes where it stopped
         line = nil; idleTicks = 25
         let sample = Self.mySamples[sampleIndex % Self.mySamples.count]

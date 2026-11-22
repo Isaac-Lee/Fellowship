@@ -9,12 +9,16 @@ struct ConversationView: View {
         VStack(spacing: 0) {
             topBar
             Divider().overlay(Color.hairline)
-            if vm.showUnpluggedBanner {
-                Text("이어폰이 빠져서 음성을 껐어요")
-                    .font(.subheadline.weight(.medium)).foregroundStyle(Color.amberText)
+            #if DEBUG
+            if vm.speakerTestMode {
+                Text("스피커 테스트 중 — 이어폰을 꽂으면 꺼져요")
+                    .font(.subheadline.weight(.medium)).foregroundStyle(.white)
                     .frame(maxWidth: .infinity).padding(.vertical, landscape ? 4 : 8)
-                    .background(Color.amberBanner)
-            }
+                    .background(Color.seal)
+            } else if vm.showUnpluggedBanner { unpluggedBanner }
+            #else
+            if vm.showUnpluggedBanner { unpluggedBanner }
+            #endif
             if landscape {
                 HStack(spacing: 0) {
                     messageList
@@ -35,9 +39,16 @@ struct ConversationView: View {
         .background(Color(.systemBackground))
         .sensoryFeedback(.impact, trigger: vm.isHoldingToTalk) { _, now in now }
         .sensoryFeedback(.success, trigger: vm.successCount)
-        .onChange(of: landscape) { vm.cancelPress() }
+        .onChange(of: landscape) { vm.pressEnded() }
         .fullScreenCover(item: $vm.showCard) { ShowCardView(message: $0) }
         .animation(.default, value: vm.showUnpluggedBanner)
+    }
+
+    private var unpluggedBanner: some View {
+        Text("이어폰이 빠져서 음성을 껐어요")
+            .font(.subheadline.weight(.medium)).foregroundStyle(Color.amberText)
+            .frame(maxWidth: .infinity).padding(.vertical, landscape ? 4 : 8)
+            .background(Color.amberBanner)
     }
 
     private var topBar: some View {
@@ -45,7 +56,6 @@ struct ConversationView: View {
             Text(vm.earphonesConnected ? "🎧 이어폰 연결됨" : "🎧 이어폰 연결 안 됨").font(.subheadline.weight(.medium))
             Spacer()
             #if DEBUG
-            if vm.speakerTestMode { Text("스피커 테스트").font(.caption2).foregroundStyle(.secondary) }
             Text("속도 \(vm.speechRate, specifier: "%.2f") · 대기 \(vm.pendingSpeechCount)")
                 .font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
             DebugMenu(vm: vm)
@@ -107,30 +117,56 @@ struct ConversationView: View {
         }
     }
 
+    private var listenButton: some View {
+        Button { vm.toggleListening() } label: {
+            VStack(spacing: 2) {
+                Text("👂").font(landscape ? .title : .title2)
+                Text(vm.isListening ? "듣는 중" : "듣기").font(.subheadline.weight(.semibold))
+            }
+            .foregroundStyle(vm.isListening ? Color.white : Color.primary)
+            .frame(maxWidth: .infinity, minHeight: 88, maxHeight: 88)
+            .background(vm.isListening ? Color.seal : Color(.systemBackground), in: .rect(cornerRadius: 20))
+            .overlay(RoundedRectangle(cornerRadius: 20)
+                .strokeBorder(vm.isListening ? Color.white.opacity(0.45) : Color.primary.opacity(0.15), lineWidth: vm.isListening ? 3 : 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("듣기 켜기/끄기")
+        .accessibilityValue(vm.isListening ? "켜짐" : "꺼짐")
+        .animation(.default, value: vm.isListening)
+    }
+
+    private var talkButton: some View {
+        Group {
+            if landscape {
+                VStack(spacing: 8) {
+                    Text("🎤").font(.largeTitle)
+                    Text(vm.isHoldingToTalk ? "손을 떼면\n번역해요" : "누르고\n말하기")
+                        .multilineTextAlignment(.center)
+                }
+            } else {
+                Text(vm.isHoldingToTalk ? "손을 떼면 번역해요" : "🎤 누르고 말하기")
+            }
+        }
+        .font(landscape ? .headline.weight(.semibold) : .title2.weight(.semibold))
+        .foregroundStyle(vm.isHoldingToTalk ? Color.white : Color.inkOn)
+        .frame(maxWidth: .infinity, minHeight: 88, maxHeight: landscape ? .infinity : 88)
+        .background(vm.isHoldingToTalk ? Color.seal : Color.ink, in: .rect(cornerRadius: 20))
+        .onLongPressGesture(minimumDuration: .infinity, maximumDistance: 200, perform: {},
+                            onPressingChanged: { $0 ? vm.pressBegan() : vm.pressEnded() })
+        .accessibilityLabel("누르고 말하기")
+    }
+
     private var talkArea: some View {
         VStack(spacing: 8) {
             if vm.retryHint { Text("다시 말해 주세요").font(.subheadline.weight(.medium)).foregroundStyle(Color.sealText) }
             if vm.isHoldingToTalk {
                 Text("● 듣는 중…").font(.subheadline.weight(.medium)).foregroundStyle(Color.sealText)
             }
-            Group {
-                if landscape {
-                    VStack(spacing: 8) {
-                        Text("🎤").font(.largeTitle)
-                        Text(vm.isHoldingToTalk ? "손을 떼면\n번역해요" : "누르고\n말하기")
-                            .multilineTextAlignment(.center)
-                    }
-                } else {
-                    Text(vm.isHoldingToTalk ? "손을 떼면 번역해요" : "🎤 누르고 말하기")
-                }
+            if landscape {
+                VStack(spacing: 12) { listenButton; talkButton }
+            } else {
+                HStack(spacing: 12) { listenButton.frame(width: 88); talkButton }
             }
-                .font(landscape ? .headline.weight(.semibold) : .title2.weight(.semibold))
-                .foregroundStyle(vm.isHoldingToTalk ? Color.white : Color.inkOn)
-                .frame(maxWidth: .infinity, minHeight: 88, maxHeight: landscape ? .infinity : 88)
-                .background(vm.isHoldingToTalk ? Color.seal : Color.ink, in: .rect(cornerRadius: 20))
-                .onLongPressGesture(minimumDuration: .infinity, maximumDistance: 200, perform: {},
-                                    onPressingChanged: { $0 ? vm.pressBegan() : vm.pressEnded() })
-                .accessibilityLabel("누르고 말하기")
         }
         .padding(16)
         .animation(.default, value: vm.isHoldingToTalk)

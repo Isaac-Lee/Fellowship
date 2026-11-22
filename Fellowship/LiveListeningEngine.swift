@@ -16,6 +16,8 @@ final class LiveMicFeeder: @unchecked Sendable {
         var koCont: AsyncStream<AnalyzerInput>.Continuation?
         var zhTarget: AVAudioFormat?
         var koTarget: AVAudioFormat?
+        var converters: [Sink: AVAudioConverter] = [:]   // written on main (startEngine), read on the audio thread: lock only
+        var onEndpoint: (@Sendable (CMTime) -> Void)?
         var timeline = 0.0                 // monotonic seconds of audio seen; independent of the input sample rate
         var zhFrames: Int64 = 0            // lane clocks, in output frames at each lane's target rate
         var koFrames: Int64 = 0
@@ -25,32 +27,31 @@ final class LiveMicFeeder: @unchecked Sendable {
         var koEnd = CMTime.zero
         var speechSeen = false
         var silence: TimeInterval = 0
+        var span: TimeInterval = 0         // seconds since speech began without an endpoint
         var lastVoicedEnd = CMTime.zero
         var lastVoiceDate = Date.distantPast
+        var rmsHist: [(t: Double, rms: Float)] = []   // last few seconds, for the adaptive noise floor
     }
 
     private let engine = AVAudioEngine()
     private let state = OSAllocatedUnfairLock(initialState: State())
-    private var converters: [Sink: AVAudioConverter] = [:]
-    private var onEndpoint: (@Sendable (CMTime) -> Void)?
 
     var lastVoiceDate: Date { state.withLock { $0.lastVoiceDate } }
     func lastEnd(_ s: Sink) -> CMTime { state.withLock { s == .zh ? $0.zhEnd : $0.koEnd } }
 
     func setSink(_ s: Sink) {
-        state.withLock { $0.sink = s; $0.speechSeen = false; $0.silence = 0 }
+        state.withLock { $0.sink = s; $0.speechSeen = false; $0.silence = 0; $0.span = 0 }
     }
 
-    func start(zh: (AsyncStream<AnalyzerInput>.Continuation, AVAudioFormat),
-               ko: (AsyncStream<AnalyzerInput>.Continuation, AVAudioFormat),
-               onEndpoint: @escaping @Sendable (CMTime) -> Void) throws {
-        self.onEndpoint = onEndpoint
-        state.withLock { $0.zhCont = zh.0; $0.koCont = ko.0; $0.zhTarget = zh.1; $0.koTarget = ko.1 }
-        try startEngine()
+    /// Lanes + endpoint callback. Does not touch the audio engine (mic stays off until restart()).
+    func configure(zh: (AsyncStream<AnalyzerInput>.Continuation, AVAudioFormat),
+                   ko: (AsyncStream<AnalyzerInput>.Continuation, AVAudioFormat),
+                   onEndpoint: @escaping @Sendable (CMTime) -> Void) {
+        state.withLock { $0.zhCont = zh.0; $0.koCont = ko.0; $0.zhTarget = zh.1; $0.koTarget = ko.1; $0.onEndpoint = onEndpoint }
     }
 
-    /// Reinstall the tap (after a config change / interruption). Lanes and timeline stay.
-    /// No-op if the engine is still running at the same input rate.
+    /// Start the engine, or reinstall the tap after a config change / interruption. Lanes and timeline stay.
+    /// No-op if the engine is already running at the same input rate.
     func restart() throws {
         if engine.isRunning, engine.inputNode.outputFormat(forBus: 0).sampleRate == tapRate { return }
         stopEngine()
@@ -58,6 +59,14 @@ final class LiveMicFeeder: @unchecked Sendable {
     }
     private var tapRate = 0.0
     private var restarts = 0
+
+    /// Mic off, lanes kept (listening OFF).
+    func stopEngine() {
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        tapRate = 0
+        state.withLock { $0.speechSeen = false; $0.silence = 0; $0.span = 0 }
+    }
 
     func stop() {
         stopEngine()
@@ -68,12 +77,13 @@ final class LiveMicFeeder: @unchecked Sendable {
         let input = engine.inputNode
         let inFmt = input.outputFormat(forBus: 0)
         guard inFmt.sampleRate > 0 else { throw NSError(domain: "LiveMicFeeder", code: 1, userInfo: [NSLocalizedDescriptionKey: "no input format"]) }
-        let (zt, kt) = state.withLock { ($0.zhTarget, $0.koTarget) }
-        converters = [:]
-        if let zt, let c = AVAudioConverter(from: inFmt, to: zt) { converters[.zh] = c }
-        if let kt, let c = AVAudioConverter(from: inFmt, to: kt) { converters[.ko] = c }
+        state.withLock { s in
+            s.converters = [:]
+            if let zt = s.zhTarget, let c = AVAudioConverter(from: inFmt, to: zt) { s.converters[.zh] = c }
+            if let kt = s.koTarget, let c = AVAudioConverter(from: inFmt, to: kt) { s.converters[.ko] = c }
+            s.zhStamps = 0; s.koStamps = 0
+        }
         tapRate = inFmt.sampleRate
-        state.withLock { $0.zhStamps = 0; $0.koStamps = 0 }
         restarts += 1
         #if DEBUG
         print("[AUDIO] engine restart #\(restarts) inputRate=\(inFmt.sampleRate)")
@@ -85,9 +95,14 @@ final class LiveMicFeeder: @unchecked Sendable {
         try engine.start()
     }
 
-    private func stopEngine() {
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+    private struct Step {
+        var sink: Sink
+        var wall: Double
+        var cont: AsyncStream<AnalyzerInput>.Continuation?
+        var conv: AVAudioConverter?
+        var endpoint: CMTime?
+        var onEndpoint: (@Sendable (CMTime) -> Void)?
+        var voiced: Bool
     }
 
     private func handle(_ buf: AVAudioPCMBuffer, inFmt: AVAudioFormat) {
@@ -97,22 +112,33 @@ final class LiveMicFeeder: @unchecked Sendable {
             vDSP_rmsqv(ch, 1, &rms, vDSP_Length(buf.frameLength))
         }
         let dur = Double(buf.frameLength) / inFmt.sampleRate
-        let voiced = rms > LiveListeningEngine.voiceRMSThreshold
+        let level = rms
 
         // Wall timeline + endpoint decision under the lock; lane stamps are assigned after conversion.
-        let (sink, wall, cont, endpoint): (Sink, Double, AsyncStream<AnalyzerInput>.Continuation?, CMTime?) = state.withLock { s in
-            var endpoint: CMTime?
+        let st: Step = state.withLock { s in
             let wall = s.timeline
             s.timeline += dur
+            // Adaptive threshold: noisy rooms raise the floor so silence can still be detected.
+            s.rmsHist.removeAll { $0.t < wall - LiveListeningEngine.noiseWindow }
+            let floor = s.rmsHist.map(\.rms).min()
+            s.rmsHist.append((wall, level))
+            var thr = LiveListeningEngine.voiceRMSThreshold
+            if let floor { thr = min(max(thr, LiveListeningEngine.noiseFactor * floor), LiveListeningEngine.voiceRMSCeiling) }
+            let voiced = level > thr
+            var endpoint: CMTime?
             if voiced { s.lastVoiceDate = Date(); s.silence = 0; s.speechSeen = true }
             else if s.speechSeen { s.silence += dur }
-            if s.sink == .zh, s.speechSeen, !voiced, s.silence >= LiveListeningEngine.silenceToFinalize {
-                endpoint = s.lastVoicedEnd; s.speechSeen = false; s.silence = 0 // already in lane-clock time
+            if s.speechSeen { s.span += dur }
+            if s.sink == .zh, s.speechSeen, (!voiced && s.silence >= LiveListeningEngine.silenceToFinalize) || s.span >= LiveListeningEngine.maxVoiceSpan {
+                endpoint = s.lastVoicedEnd; s.speechSeen = false; s.silence = 0; s.span = 0 // already in lane-clock time
             }
-            return (s.sink, wall, s.sink == .zh ? s.zhCont : s.sink == .ko ? s.koCont : nil, endpoint)
+            let sink = s.sink
+            return Step(sink: sink, wall: wall, cont: sink == .zh ? s.zhCont : sink == .ko ? s.koCont : nil,
+                        conv: s.converters[sink], endpoint: endpoint, onEndpoint: s.onEndpoint, voiced: voiced)
         }
-        if let endpoint { onEndpoint?(endpoint) }
-        guard sink != .none, let cont, let conv = converters[sink] else { return }
+        if let e = st.endpoint { st.onEndpoint?(e) }
+        let sink = st.sink, voiced = st.voiced, wall = st.wall
+        guard sink != .none, let cont = st.cont, let conv = st.conv else { return }
 
         let target = conv.outputFormat
         let cap = AVAudioFrameCount(Double(buf.frameLength) * target.sampleRate / inFmt.sampleRate) + 16
@@ -154,11 +180,26 @@ final class LiveMicFeeder: @unchecked Sendable {
 final class LiveListeningEngine: ListeningEngine {
     /// Silence after speech (partner mode) that forces a final result.
     nonisolated static let silenceToFinalize: TimeInterval = 0.7
-    /// RMS level above which a buffer counts as voice.
+    /// Base RMS level above which a buffer counts as voice.
     nonisolated static let voiceRMSThreshold: Float = 0.01
+    /// Adaptive threshold = clamp(noiseFactor x minimum RMS over noiseWindow, base...ceiling).
+    nonisolated static let noiseFactor: Float = 2.5
+    nonisolated static let noiseWindow: TimeInterval = 3
+    nonisolated static let voiceRMSCeiling: Float = 0.08
+    /// Partner mode: volatile zh text unchanged this long forces a final.
+    static let textStableToFinalize: TimeInterval = 0.8
+    /// Partner mode: force a final after this much continuous voice.
+    nonisolated static let maxVoiceSpan: TimeInterval = 8
+    /// Each translation is abandoned after this long.
+    static let translateTimeout: TimeInterval = 2.5
+    /// Zh finals shorter than this (voiced audio) are dropped.
+    static let minFinalDuration: TimeInterval = 0.4
+    static let startRetryDelay: TimeInterval = 1
 
     /// Called when a speech/translation model turns out not to be installed.
     var onMissingData: (@MainActor () -> Void)?
+    /// Audio interruption began (call, Siri...): the VM silences TTS.
+    var onInterruptionBegan: (@MainActor () -> Void)?
 
     @MainActor private final class Lane {
         let analyzer: SpeechAnalyzer
@@ -166,29 +207,33 @@ final class LiveListeningEngine: ListeningEngine {
         let format: AVAudioFormat
         let cont: AsyncStream<AnalyzerInput>.Continuation
         var task: Task<Void, Never>?
-        var dropping = false // results ignored while a flush runs
+        var cutoff = CMTime.zero // results whose audio range ends at or before this are stale
         init(analyzer: SpeechAnalyzer, transcriber: SpeechTranscriber, format: AVAudioFormat, cont: AsyncStream<AnalyzerInput>.Continuation) {
             self.analyzer = analyzer; self.transcriber = transcriber; self.format = format; self.cont = cont
         }
-        /// Force finals through `t`, ignoring whatever they produce.
+        func isStale(_ range: CMTimeRange) -> Bool { range.isValid && range.end <= cutoff }
+        /// Force finals through `t`; whatever they produce is dropped by the cutoff.
         func flush(through t: CMTime) async {
-            dropping = true
+            if t > cutoff { cutoff = t }
             try? await analyzer.finalize(through: t)
-            try? await Task.sleep(for: .milliseconds(150))
-            dropping = false
         }
     }
 
     private enum KoState { case idle, collecting, finalizing }
+    private struct TranslateTimeout: Error {}
 
     private let zhHant = Locale.Language(identifier: "zh-Hant")
     private let koLang = Locale.Language(identifier: "ko")
     private let feeder = LiveMicFeeder()
     private var continuation: AsyncStream<ListenEvent>.Continuation?
     private var mode = ListenMode.paused
+    private var resting = ListenMode.idle // last of .partner/.idle set by the VM
     private var running = false, starting = false
+    private var startGen = 0
     private var zh: Lane?, ko: Lane?
     private var startTask: Task<Void, Never>?
+    private var retryTask: Task<Void, Never>?
+    private var stableTask: Task<Void, Never>?
     private var partnerQueue: AsyncStream<(text: String, voice: Date)>.Continuation?
     private var partnerWorker: Task<Void, Never>?
     private var zhToKo: TranslationSession?, koToZh: TranslationSession?
@@ -210,23 +255,30 @@ final class LiveListeningEngine: ListeningEngine {
     }
 
     func setMode(_ new: ListenMode) {
+        let old = mode
         mode = new
         switch new {
         case .paused: teardown()
-        case .partner:
-            if running { applySink() } else { startIfNeeded() }
+        case .partner, .idle:
+            resting = new
+            if new == .idle { stableTask?.cancel(); lastPartnerPartial = "" }
+            if running {
+                if new == .idle, old != .idle, let zh { let e = feeder.lastEnd(.zh); Task { await zh.flush(through: e) } } // drop the in-flight line
+                applyMode()
+            } else { startIfNeeded() }
         case .me:
+            stableTask?.cancel()
             koFinals = []; koVolatile = ""; lastMyPartial = ""; koState = .collecting
-            applySink()
+            if running { applyMode() } else { startIfNeeded() }
         }
     }
 
     func endMine(valid: Bool) {
         guard mode == .me else { return }
-        mode = .partner
         let koEnd = feeder.lastEnd(.ko)
         let released = feeder.lastVoiceDate
-        applySink() // partner line resumes immediately
+        mode = resting
+        applyMode() // partner line resumes immediately; idle stops the mic
         guard valid else {
             koState = .idle
             if let ko { Task { await ko.flush(through: koEnd) } }
@@ -238,6 +290,13 @@ final class LiveListeningEngine: ListeningEngine {
         Task { await finishMine(koEnd: koEnd, released: released) }
     }
 
+    /// App became active: audio may have been killed without an `.ended` interruption.
+    func resume() {
+        guard mode != .paused else { return }
+        guard running else { startIfNeeded(); return }
+        restartAudio(reactivate: true)
+    }
+
     // MARK: My turn
 
     // ponytail: a second press while the previous one is still finalizing shares koFinals; fine for a human-speed button.
@@ -247,6 +306,7 @@ final class LiveListeningEngine: ListeningEngine {
         try? await Task.sleep(for: .milliseconds(150))
         let text = (koFinals + [koVolatile]).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         if koState == .finalizing { koState = .idle }
+        if koEnd > ko.cutoff { ko.cutoff = koEnd } // late results of this turn must not leak into the next
         let tFinal = Date()
         guard !text.isEmpty else { continuation?.yield(.myFailed); return }
         do {
@@ -259,9 +319,36 @@ final class LiveListeningEngine: ListeningEngine {
         }
     }
 
+    /// Races the translation against `translateTimeout`. The translation itself may ignore cancellation,
+    /// so this resumes on whichever finishes first instead of waiting for both (a task group would wait).
+    private func translate(_ text: String, partner: Bool) async throws -> String {
+        let done = OSAllocatedUnfairLock(initialState: false)
+        do {
+            return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+                let finish: @Sendable (Result<String, Error>) -> Void = { r in
+                    if done.withLock({ let was = $0; $0 = true; return was }) { return }
+                    cont.resume(with: r)
+                }
+                Task { @MainActor in
+                    do { finish(.success(try await self.translateOnce(text, partner: partner))) }
+                    catch { finish(.failure(error)) }
+                }
+                Task {
+                    try? await Task.sleep(for: .seconds(Self.translateTimeout))
+                    finish(.failure(TranslateTimeout()))
+                }
+            }
+        } catch let e as TranslateTimeout {
+            // The session may be wedged: give the next sentence a fresh one.
+            if partner { zhToKo = TranslationSession(installedSource: zhHant, target: koLang) }
+            else { koToZh = TranslationSession(installedSource: koLang, target: zhHant) }
+            throw e
+        }
+    }
+
     /// partner: zh→ko (serial partner worker), else ko→zh (my turn). Each direction has its own session.
     /// CancellationError (seen when another translation consumer is active) is retried once on a fresh session.
-    private func translate(_ text: String, partner: Bool) async throws -> String {
+    private func translateOnce(_ text: String, partner: Bool) async throws -> String {
         for attempt in 0..<2 {
             guard let s = partner ? zhToKo : koToZh else { throw NSError(domain: "LiveListeningEngine", code: 2) }
             nonisolated(unsafe) let sess = s // SDK hands a MainActor session to a @concurrent method
@@ -277,16 +364,38 @@ final class LiveListeningEngine: ListeningEngine {
 
     // MARK: Results
 
-    private func handleZh(_ text: String, isFinal: Bool) {
-        guard zh?.dropping == false else { return }
-        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty else { return }
-        if isFinal { log("[ENGINE] zh final: \(t)"); lastPartnerPartial = ""; partnerQueue?.yield((t, feeder.lastVoiceDate)) }
-        else if t != lastPartnerPartial { lastPartnerPartial = t; continuation?.yield(.partnerPartial(t)) }
+    private static func isJunk(_ t: String, voiced: TimeInterval?) -> String? {
+        if !t.unicodeScalars.contains(where: { $0.properties.isUnifiedIdeograph }) { return "no Han" }
+        let fillers = Set("嗯啊呃哦喔欸")
+        if t.allSatisfy({ fillers.contains($0) || $0.isPunctuation || $0.isWhitespace }) { return "fillers" }
+        if let voiced, voiced < minFinalDuration { return "short \(voiced)s" }
+        return nil
     }
 
-    private func handleKo(_ text: String, isFinal: Bool) {
-        guard ko?.dropping == false, koState != .idle else { return }
+    private func handleZh(_ text: String, isFinal: Bool, range: CMTimeRange) {
+        guard let lane = zh, !lane.isStale(range) else { return }
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        if isFinal {
+            stableTask?.cancel(); lastPartnerPartial = ""
+            if let why = Self.isJunk(t, voiced: range.isValid ? range.duration.seconds : nil) { log("[ENGINE] dropped junk: \(t) (\(why))"); return }
+            log("[ENGINE] zh final: \(t)")
+            partnerQueue?.yield((t, feeder.lastVoiceDate))
+        } else if t != lastPartnerPartial {
+            lastPartnerPartial = t; continuation?.yield(.partnerPartial(t))
+            // Text-stability endpoint: noisy rooms may never produce enough silence.
+            stableTask?.cancel()
+            stableTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(Self.textStableToFinalize))
+                guard !Task.isCancelled, let self, self.mode == .partner, self.lastPartnerPartial == t, let zh = self.zh else { return }
+                self.log("[ENGINE] text stable \(Self.textStableToFinalize)s → finalize")
+                try? await zh.analyzer.finalize(through: self.feeder.lastEnd(.zh))
+            }
+        }
+    }
+
+    private func handleKo(_ text: String, isFinal: Bool, range: CMTimeRange) {
+        guard let lane = ko, !lane.isStale(range), koState != .idle else { return }
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if isFinal { log("[ENGINE] ko final: \(t)"); if !t.isEmpty { koFinals.append(t) }; koVolatile = "" } else { koVolatile = t }
         if koState == .collecting {
@@ -303,28 +412,63 @@ final class LiveListeningEngine: ListeningEngine {
                 if Task.isCancelled { return }
                 continuation?.yield(.partnerFinal(zh: item.text, ko: ko))
                 log("[LAT] partner speechEnd→final \(ms(from: item.voice, to: tFinal)) →translated \(ms(from: item.voice, to: Date()))")
-            } catch { log("[ENGINE] translate failed: zh→ko \(error)") }
+            } catch { log("[ENGINE] translate failed, sentence skipped: zh→ko \(error)") }
         }
     }
 
     // MARK: Lifecycle
 
-    private func applySink() {
+    /// Sink + mic for the current mode. Mic is on only for .partner / .me.
+    private func applyMode() {
         feeder.setSink(mode == .partner ? .zh : mode == .me ? .ko : .none)
-    }
-
-    private func startIfNeeded() {
-        guard !running, !starting else { return }
-        starting = true
-        startTask = Task {
-            do { try await start() ; running = true }
-            catch { log("[ENGINE] start failed: \(error)") }
-            starting = false
-            if running { if mode == .paused { teardown() } else { applySink() } }
+        switch mode {
+        case .partner, .me: ensureAudio()
+        case .idle: retryTask?.cancel(); feeder.stopEngine()
+        case .paused: break
         }
     }
 
-    private func start() async throws {
+    private func ensureAudio() {
+        guard running, mode == .partner || mode == .me else { return }
+        do { try feeder.restart() }
+        catch {
+            log("[ENGINE] audio start failed: \(error)")
+            try? AudioSessionSetup.activate()
+            do { try feeder.restart() }
+            catch { scheduleAudioRetry() }
+        }
+    }
+
+    private func scheduleAudioRetry() {
+        retryTask?.cancel()
+        retryTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.startRetryDelay))
+            guard !Task.isCancelled, let self else { return }
+            self.ensureAudio()
+        }
+    }
+
+    private func startIfNeeded() {
+        guard !running, !starting, mode != .paused else { return }
+        starting = true
+        startGen += 1
+        let gen = startGen
+        startTask = Task {
+            var retry = false
+            do { try await start(gen: gen); running = true }
+            catch is CancellationError {}
+            catch { log("[ENGINE] start failed: \(error)"); retry = true }
+            guard gen == startGen else { return } // torn down meanwhile; a newer start owns the flags
+            starting = false
+            if running { applyMode() }
+            else if retry, mode != .paused {
+                try? await Task.sleep(for: .seconds(Self.startRetryDelay))
+                if gen == startGen, mode != .paused { startIfNeeded() }
+            }
+        }
+    }
+
+    private func start(gen: Int) async throws {
         try AudioSessionSetup.activate()
         guard let zhLoc = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "zh-TW")),
               let koLoc = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "ko-KR")) else {
@@ -339,26 +483,37 @@ final class LiveListeningEngine: ListeningEngine {
         guard a == .installed, b == .installed else { missingData("translation not installed"); throw CancellationError() }
         try Task.checkCancellation()
 
-        let zhLane = try await makeLane(zhLoc), koLane = try await makeLane(koLoc)
+        let zhLane = try await makeLane(zhLoc)
+        let koLane: Lane
+        do { koLane = try await makeLane(koLoc) } catch { await zhLane.analyzer.cancelAndFinishNow(); throw error }
+        guard gen == startGen, !Task.isCancelled else { // torn down while preparing
+            zhLane.cont.finish(); koLane.cont.finish()
+            await zhLane.analyzer.cancelAndFinishNow(); await koLane.analyzer.cancelAndFinishNow()
+            throw CancellationError()
+        }
         zhToKo = TranslationSession(installedSource: zhHant, target: koLang)
         koToZh = TranslationSession(installedSource: koLang, target: zhHant)
         zh = zhLane; ko = koLane
         zhLane.task = Task { [weak self] in
-            do { for try await r in zhLane.transcriber.results { self?.handleZh(String(r.text.characters), isFinal: r.isFinal) } }
+            do { for try await r in zhLane.transcriber.results { self?.handleZh(String(r.text.characters), isFinal: r.isFinal, range: r.range) } }
             catch { self?.log("[ENGINE] zh results: \(error)") }
         }
         koLane.task = Task { [weak self] in
-            do { for try await r in koLane.transcriber.results { self?.handleKo(String(r.text.characters), isFinal: r.isFinal) } }
+            do { for try await r in koLane.transcriber.results { self?.handleKo(String(r.text.characters), isFinal: r.isFinal, range: r.range) } }
             catch { self?.log("[ENGINE] ko results: \(error)") }
         }
         let (q, qc) = AsyncStream.makeStream(of: (text: String, voice: Date).self)
         partnerQueue = qc
         partnerWorker = Task { await runPartnerWorker(q) }
 
-        try feeder.start(zh: (zhLane.cont, zhLane.format), ko: (koLane.cont, koLane.format)) { [weak self] t in
+        // Lanes only: the mic starts in applyMode() when the mode needs it.
+        feeder.configure(zh: (zhLane.cont, zhLane.format), ko: (koLane.cont, koLane.format)) { [weak self] t in
             Task { @MainActor in self?.endpoint(t) }
         }
-        observers = Self.observe { @MainActor [weak self] reactivate in self?.restartAudio(reactivate: reactivate) }
+        for o in observers { NotificationCenter.default.removeObserver(o) }
+        observers = Self.observe(
+            restart: { @MainActor [weak self] reactivate in self?.restartAudio(reactivate: reactivate) },
+            began: { @MainActor [weak self] in self?.onInterruptionBegan?() })
     }
 
     private func makeLane(_ loc: Locale) async throws -> Lane {
@@ -372,7 +527,7 @@ final class LiveListeningEngine: ListeningEngine {
         return Lane(analyzer: analyzer, transcriber: tr, format: fmt, cont: cont)
     }
 
-    /// VAD saw speech then silence in partner mode: force a final through the last voiced buffer.
+    /// VAD saw speech then silence (or 8 s of voice) in partner mode: force a final through the last voiced buffer.
     private func endpoint(_ t: CMTime) {
         guard mode == .partner, let zh else { return }
         Task { try? await zh.analyzer.finalize(through: t) }
@@ -381,6 +536,10 @@ final class LiveListeningEngine: ListeningEngine {
     /// Debounced: at most one restart per 0.5 s, with one trailing restart for notifications that arrive inside the window.
     private func restartAudio(reactivate: Bool) {
         guard running, mode != .paused else { return }
+        if mode == .idle { // mic stays off; just revive the session after an interruption
+            if reactivate { try? AudioSessionSetup.activate() }
+            return
+        }
         let wait = 0.5 - Date().timeIntervalSince(lastRestart)
         if wait > 0 && !reactivate {
             guard !restartPending else { return }
@@ -390,13 +549,16 @@ final class LiveListeningEngine: ListeningEngine {
         }
         lastRestart = Date()
         do {
-            if reactivate { try AudioSessionSetup.activate() } // interruption ended: session was deactivated
+            if reactivate { try AudioSessionSetup.activate() } // interruption ended / app returned: session may be deactivated
             try feeder.restart()
-        } catch { log("[ENGINE] audio restart failed: \(error)") }
+        } catch { log("[ENGINE] audio restart failed: \(error)"); scheduleAudioRetry() }
     }
 
     private func teardown() {
-        startTask?.cancel()
+        startGen += 1; starting = false
+        startTask?.cancel(); startTask = nil
+        retryTask?.cancel(); retryTask = nil
+        stableTask?.cancel(); stableTask = nil
         feeder.stop()
         for o in observers { NotificationCenter.default.removeObserver(o) }
         observers = []
@@ -419,13 +581,17 @@ final class LiveListeningEngine: ListeningEngine {
     }
 
     // Notification observers are built in a nonisolated context: they fire on arbitrary threads.
-    nonisolated private static func observe(_ hop: @escaping @Sendable @MainActor (_ reactivate: Bool) -> Void) -> [NSObjectProtocol] {
+    nonisolated private static func observe(restart: @escaping @Sendable @MainActor (_ reactivate: Bool) -> Void,
+                                            began: @escaping @Sendable @MainActor () -> Void) -> [NSObjectProtocol] {
         [.AVAudioEngineConfigurationChange, AVAudioSession.interruptionNotification].map { name in
             NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { @Sendable note in
-                if name == AVAudioSession.interruptionNotification,
-                   (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) != AVAudioSession.InterruptionType.ended.rawValue { return }
-                let reactivate = name == AVAudioSession.interruptionNotification
-                Task { @MainActor in hop(reactivate) }
+                if name == AVAudioSession.interruptionNotification {
+                    let type = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+                    if type == AVAudioSession.InterruptionType.began.rawValue { Task { @MainActor in began() } }
+                    else if type == AVAudioSession.InterruptionType.ended.rawValue { Task { @MainActor in restart(true) } }
+                } else {
+                    Task { @MainActor in restart(false) }
+                }
             }
         }
     }

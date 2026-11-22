@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import Fellowship
 
@@ -20,6 +21,8 @@ private final class FakeListening: ListeningEngine {
     func events() -> AsyncStream<ListenEvent> { AsyncStream { _ in } }
     func setMode(_ mode: ListenMode) { modes.append(mode) }
     func endMine(valid: Bool) { endMineCalls.append(valid) }
+    func resume() {}
+    var onInterruptionBegan: (@MainActor () -> Void)?
 }
 
 @MainActor
@@ -106,6 +109,7 @@ struct ConversationLogicTests {
     @Test func speakerTestModeSpeaksWithoutEarphones() {
         let speech = FakeSpeech()
         let vm = makeVM(speech)
+        vm.speakerOverride = { _ in }
         vm.earphonesConnected = false
         vm.handle(.partnerFinal(zh: "x", ko: "하나"))
         #expect(speech.spoken.isEmpty)
@@ -114,5 +118,39 @@ struct ConversationLogicTests {
         #expect(speech.spoken.map(\.text) == ["둘"])
         vm.speakerTestMode = false
     }
+
+    @Test func speakerTestModeDefaultsOffAndClearsOnEarphoneConnect() {
+        let vm = makeVM()
+        vm.speakerOverride = { _ in }
+        #expect(vm.speakerTestMode == false)
+        vm.earphonesDidChange(connected: false)
+        vm.speakerTestMode = true
+        vm.earphonesDidChange(connected: true)
+        #expect(vm.speakerTestMode == false)
+    }
     #endif
+
+    // MARK: listening toggle
+    @Test func listeningStartsOffAndToggles() {
+        let listening = FakeListening()
+        let vm = makeVM(FakeSpeech(), listening)
+        #expect(vm.isListening == false)
+        vm.start()
+        vm.toggleListening()
+        vm.toggleListening()
+        #expect(listening.modes == [.idle, .partner, .idle])
+        #expect(vm.isListening == false)
+    }
+
+    // MARK: valid press
+    @Test func longPressIsTranslated() {
+        let listening = FakeListening()
+        let vm = makeVM(FakeSpeech(), listening)
+        let t0 = Date()
+        vm.now = { t0 }
+        vm.pressBegan()
+        vm.now = { t0.addingTimeInterval(0.6) }
+        vm.pressEnded()
+        #expect(listening.endMineCalls == [true])
+    }
 }

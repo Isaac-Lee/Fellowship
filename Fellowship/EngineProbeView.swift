@@ -290,7 +290,6 @@ struct EngineProbeView: View {
                     Button("ko-KR 인식 테스트") { Task { await p.liveTest("ko-KR") } }.disabled(p.running)
                     Button("zh-TW 음성 데이터 다운로드") { Task { await p.downloadSpeech("zh-TW") } }
                     Button("ko-KR 음성 데이터 다운로드") { Task { await p.downloadSpeech("ko-KR") } }
-                    Button("zh-CN 음성 데이터 다운로드") { Task { await p.downloadSpeech("zh-CN") } }
                     Button("번역 데이터 다운로드") { p.startTranslationDownload() }
                     Button("한국어 음성 테스트") { p.speakKorean() }
                 }
